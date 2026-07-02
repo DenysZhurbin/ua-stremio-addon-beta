@@ -104,11 +104,10 @@ async function getTitleById(type, id) {
 async function resultsToStreams(results, cookieString, source) {
   const streams = []
 
-  // Беремо топ 3 за кількістю сідів — Toloka банить (HTTP 429) за занадто
-  // часті послідовні запити до download.php, тож менше запитів = стабільніше
+  // Беремо топ 5 за кількістю сідів (429 вже вирішено паузою між запитами)
   const topResults = results
     .sort((a, b) => b.seeders - a.seeders)
-    .slice(0, 3)
+    .slice(0, 5)
 
   let isFirst = true
   for (const result of topResults) {
