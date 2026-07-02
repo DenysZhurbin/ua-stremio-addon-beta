@@ -122,24 +122,26 @@ function configPage() {
 
   <script>
     function install() {
-      const config = {
-        tolokaLogin: document.getElementById('tolokaLogin').value,
-        tolokaPassword: document.getElementById('tolokaPassword').value,
-        mazepaLogin: document.getElementById('mazepaLogin').value,
-        mazepaPassword: document.getElementById('mazepaPassword').value,
-      }
-      const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(config))))
-      const manifestUrl = 'http://localhost:7000/' + encoded + '/manifest.json'
-      const stremioUrl = 'stremio://' + 'localhost:7000/' + encoded + '/manifest.json'
+        const config = {
+            tolokaLogin: document.getElementById('tolokaLogin').value,
+            tolokaPassword: document.getElementById('tolokaPassword').value,
+            mazepaLogin: document.getElementById('mazepaLogin').value,
+            mazepaPassword: document.getElementById('mazepaPassword').value,
+        }
 
-      // Показуємо посилання
-      document.getElementById('installLink').style.display = 'block'
-      document.getElementById('manifestUrl').textContent = manifestUrl
-      document.getElementById('manifestUrl').href = manifestUrl
+        const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(config))))
 
-      // Відкриваємо Stremio
-      window.location.href = stremioUrl
-    }
+        const baseUrl = window.location.origin
+
+        const manifestUrl = baseUrl + '/' + encoded + '/manifest.json'
+        const stremioUrl = 'stremio://' + window.location.host + '/' + encoded + '/manifest.json'
+
+        document.getElementById('installLink').style.display = 'block'
+        document.getElementById('manifestUrl').textContent = manifestUrl
+        document.getElementById('manifestUrl').href = manifestUrl
+
+        window.location.href = stremioUrl
+        }
   </script>
 </body>
 </html>
