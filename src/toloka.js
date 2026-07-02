@@ -162,11 +162,26 @@ async function getTorrentInfo(cookieString, torrentUrl) {
       : `${TOLOKA_URL}/${downloadHref}`
 
     // Завантажуємо САМ .torrent файл (бінарно), з тими самими cookies,
-    // на боці аддону — а не віддаємо це посилання в Stremio
-    const torrentResponse = await client.get(downloadUrl, {
-      headers: { Cookie: cookieString },
-      responseType: 'arraybuffer',
-    })
+    // на боці аддону — а не віддаємо це посилання в Stremio.
+    // Toloka банить занадто часті запити (429) — при цьому чекаємо і пробуємо ще раз.
+    let torrentResponse
+    try {
+      torrentResponse = await client.get(downloadUrl, {
+        headers: { Cookie: cookieString },
+        responseType: 'arraybuffer',
+      })
+    } catch (err) {
+      if (err.response?.status === 429) {
+        console.log('Toloka: 429, чекаємо 4с і пробуємо ще раз...')
+        await new Promise(r => setTimeout(r, 4000))
+        torrentResponse = await client.get(downloadUrl, {
+          headers: { Cookie: cookieString },
+          responseType: 'arraybuffer',
+        })
+      } else {
+        throw err
+      }
+    }
 
     const buffer = Buffer.from(torrentResponse.data)
 

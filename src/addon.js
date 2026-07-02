@@ -82,6 +82,8 @@ function pickVideoFileIdx(files) {
   return bestIdx
 }
 
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+
 // Отримуємо назву фільму по IMDB ID через Cinemeta
 async function getTitleById(type, id) {
   try {
@@ -102,13 +104,19 @@ async function getTitleById(type, id) {
 async function resultsToStreams(results, cookieString, source) {
   const streams = []
 
-  // Беремо топ 5 за кількістю сідів
+  // Беремо топ 3 за кількістю сідів — Toloka банить (HTTP 429) за занадто
+  // часті послідовні запити до download.php, тож менше запитів = стабільніше
   const topResults = results
     .sort((a, b) => b.seeders - a.seeders)
-    .slice(0, 5)
+    .slice(0, 3)
 
+  let isFirst = true
   for (const result of topResults) {
     try {
+      // Пауза між запитами до download.php, щоб не впертись у rate-limit (429)
+      if (!isFirst) await sleep(2500)
+      isFirst = false
+
       const info = source === 'toloka'
         ? await toloka.getTorrentInfo(cookieString, result.url)
         : await mazepa.getTorrentInfo(cookieString, result.url)
@@ -132,10 +140,9 @@ async function resultsToStreams(results, cookieString, source) {
       const trackers = (parsed.announce || []).filter(
         a => a.startsWith('http') || a.startsWith('udp')
       )
-      const sources = [
-        ...trackers.map(t => `tracker:${t}`),
-        `dht:${parsed.infoHash}`,
-      ]
+      // DHT свідомо не додаємо: Toloka — приватний трекер,
+      // легітимні клієнти на приватних трекерах DHT/PEX не використовують.
+      const sources = trackers.map(t => `tracker:${t}`)
 
       streams.push({
         name: flag,
@@ -165,14 +172,27 @@ function buildAddon(config) {
 
     const streams = []
 
-    // Отримуємо назву фільму по IMDB ID через Cinemeta
+    // Для серіалів Stremio передає id у форматі "tt1234567:сезон:епізод" —
+    // Cinemeta ж очікує лише базовий tt-ідентифікатор, інакше 404.
+    const [imdbId, season, episode] = id.split(':')
+
+    // Отримуємо назву фільму/серіалу по IMDB ID через Cinemeta
     let searchQuery
     try {
       const meta = await axios.get(
-        `https://v3-cinemeta.strem.io/meta/${type}/${id}.json`,
+        `https://v3-cinemeta.strem.io/meta/${type}/${imdbId}.json`,
         { timeout: 8000 }
       )
       searchQuery = meta.data?.meta?.name
+
+      // Додаємо S01E01 до пошукового запиту, щоб не отримувати весь серіал
+      // впереміш з потрібним епізодом
+      if (season && episode) {
+        const s = String(season).padStart(2, '0')
+        const e = String(episode).padStart(2, '0')
+        searchQuery = `${searchQuery} S${s}E${e}`
+      }
+
       console.log(`Шукаємо: "${searchQuery}"`)
     } catch (err) {
       console.error('Cinemeta error:', err.message)
