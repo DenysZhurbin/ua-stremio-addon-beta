@@ -44,6 +44,44 @@ async function getSession(source, login, password) {
   return session
 }
 
+// parse-torrent (v10+) — чистий ESM-пакет, тому в CommonJS-коді
+// його можна підключити лише через динамічний import().
+let parseTorrentPromise = null
+function getParseTorrent() {
+  if (!parseTorrentPromise) {
+    parseTorrentPromise = import('parse-torrent').then(m => m.default || m)
+  }
+  return parseTorrentPromise
+}
+
+// Парсить або magnet-рядок, або Buffer реального .torrent файлу.
+// В обох випадках вся потрібна інформація вже міститься в самих даних,
+// тож мережеві запити (DHT) для цього не потрібні.
+async function parseTorrentInfo(info) {
+  const parseTorrent = await getParseTorrent()
+  const source = info.type === 'magnet' ? info.magnet : info.buffer
+  return parseTorrent(source)
+}
+
+// Якщо в торренті кілька файлів — обираємо найбільший відеофайл,
+// щоб Stremio одразу відтворював потрібне, а не список файлів.
+function pickVideoFileIdx(files) {
+  if (!Array.isArray(files) || files.length <= 1) return undefined
+
+  const videoExt = /\.(mp4|mkv|avi|mov|webm|m4v|ts)$/i
+  let bestIdx
+  let bestSize = -1
+
+  files.forEach((file, idx) => {
+    if (videoExt.test(file.name) && file.length > bestSize) {
+      bestSize = file.length
+      bestIdx = idx
+    }
+  })
+
+  return bestIdx
+}
+
 // Отримуємо назву фільму по IMDB ID через Cinemeta
 async function getTitleById(type, id) {
   try {
@@ -71,14 +109,18 @@ async function resultsToStreams(results, cookieString, source) {
 
   for (const result of topResults) {
     try {
-      let magnet
-      if (source === 'toloka') {
-        magnet = await toloka.getMagnet(cookieString, result.url)
-      } else {
-        magnet = await mazepa.getMagnet(cookieString, result.url)
-      }
+      const info = source === 'toloka'
+        ? await toloka.getTorrentInfo(cookieString, result.url)
+        : await mazepa.getTorrentInfo(cookieString, result.url)
 
-      if (!magnet) continue
+      if (!info) continue
+
+      const parsed = await parseTorrentInfo(info)
+
+      if (!parsed?.infoHash) {
+        console.error(`Не вдалося отримати infoHash для "${result.title}"`)
+        continue
+      }
 
       // Визначаємо якість з назви
       const quality = result.title.match(/4K|2160p|1080p|720p|480p/i)?.[0] || 'HD'
@@ -86,17 +128,27 @@ async function resultsToStreams(results, cookieString, source) {
       // Флаг джерела
       const flag = source === 'toloka' ? '🇺🇦 Toloka' : '🇺🇦 Mazepa'
 
+      // Трекери з .torrent/magnet + DHT як запасний варіант
+      const trackers = (parsed.announce || []).filter(
+        a => a.startsWith('http') || a.startsWith('udp')
+      )
+      const sources = [
+        ...trackers.map(t => `tracker:${t}`),
+        `dht:${parsed.infoHash}`,
+      ]
+
       streams.push({
         name: flag,
         title: `${result.title}\n${quality} | ${result.size} | 👥 ${result.seeders}`,
-        url: magnet,
+        infoHash: parsed.infoHash,
+        fileIdx: pickVideoFileIdx(parsed.files),
+        sources,
         behaviorHints: {
           bingeGroup: `ua-addon-${source}`,
-          notWebReady: true,
         },
       })
     } catch (err) {
-      console.error(`Помилка отримання magnet для ${result.title}:`, err.message)
+      console.error(`Помилка отримання torrent-даних для "${result.title}":`, err.message)
     }
   }
 

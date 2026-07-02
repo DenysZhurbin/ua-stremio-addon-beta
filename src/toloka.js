@@ -128,7 +128,12 @@ async function search(cookieString, query) {
   }
 }
 
-async function getMagnet(cookieString, torrentUrl) {
+// Повертає інформацію, достатню щоб побудувати повноцінний torrent-стрім:
+// або готовий magnet-рядок, або реальні байти .torrent файлу.
+// НІКОЛИ не повертає "голий" URL на download.php — Stremio не вміє
+// відкривати його з cookies, тож раніше саме тут була причина
+// "нічого не відтворюється".
+async function getTorrentInfo(cookieString, torrentUrl) {
   const client = createClient()
 
   try {
@@ -138,42 +143,47 @@ async function getMagnet(cookieString, torrentUrl) {
 
     const $ = cheerio.load(response.data)
 
-    // ===== DEBUG =====
-    $('a').each((i, el) => {
-      const href = $(el).attr('href')
-      if (href) {
-        console.log('LINK:', href)
-      }
-    })
-    // =================
-
-    // Спочатку шукаємо готовий magnet
+    // Спочатку перевіряємо чи є готовий magnet
     const magnetLink = $('a[href^="magnet:"]').first().attr('href')
-
     if (magnetLink) {
       console.log('Toloka: знайдено MAGNET')
-      return magnetLink
+      return { type: 'magnet', magnet: magnetLink }
     }
 
-    // Якщо magnet немає — використовуємо download.php
-    const downloadLink = $('a[href*="download.php"]').first().attr('href')
-
-    if (downloadLink) {
-      console.log('Toloka: знайдено download.php')
-
-      return downloadLink.startsWith('http')
-        ? downloadLink
-        : `${TOLOKA_URL}/${downloadLink}`
+    // Інакше шукаємо посилання на завантаження .torrent файлу
+    const downloadHref = $('a[href*="download.php"]').first().attr('href')
+    if (!downloadHref) {
+      console.log('Toloka: посилання на завантаження не знайдено')
+      return null
     }
 
-    console.log('Toloka: нічого не знайдено')
+    const downloadUrl = downloadHref.startsWith('http')
+      ? downloadHref
+      : `${TOLOKA_URL}/${downloadHref}`
 
-    return null
+    // Завантажуємо САМ .torrent файл (бінарно), з тими самими cookies,
+    // на боці аддону — а не віддаємо це посилання в Stremio
+    const torrentResponse = await client.get(downloadUrl, {
+      headers: { Cookie: cookieString },
+      responseType: 'arraybuffer',
+    })
+
+    const buffer = Buffer.from(torrentResponse.data)
+
+    // .torrent файл — це bencode-словник, він завжди починається з байта 'd' (0x64).
+    // Якщо це не так — значить cookies недійсні і нам віддали HTML-сторінку логіну.
+    if (buffer.length === 0 || buffer[0] !== 0x64) {
+      console.error('Toloka: download.php повернув не .torrent файл (ймовірно, недійсні cookies)')
+      return null
+    }
+
+    console.log(`Toloka: отримано .torrent файл (${buffer.length} байт)`)
+    return { type: 'file', buffer }
 
   } catch (err) {
-    console.error('Toloka getMagnet error:', err.message)
+    console.error('Toloka getTorrentInfo error:', err.message)
     return null
   }
 }
 
-module.exports = { login, search, getMagnet }
+module.exports = { login, search, getTorrentInfo }
