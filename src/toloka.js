@@ -133,20 +133,40 @@ async function getMagnet(cookieString, torrentUrl) {
 
   try {
     const response = await client.get(torrentUrl, {
-      headers: { 'Cookie': cookieString },
+      headers: { Cookie: cookieString },
     })
 
     const $ = cheerio.load(response.data)
 
-    // Toloka використовує download.php?id=XXXXX
-    const downloadLink = $('a[href*="download.php"]').first().attr('href') ||
-                         $('a[title*="завантажити" i], a[title*="torrent" i]').first().attr('href')
+    // ===== DEBUG =====
+    $('a').each((i, el) => {
+      const href = $(el).attr('href')
+      if (href) {
+        console.log('LINK:', href)
+      }
+    })
+    // =================
+
+    // Спочатку шукаємо готовий magnet
+    const magnetLink = $('a[href^="magnet:"]').first().attr('href')
+
+    if (magnetLink) {
+      console.log('Toloka: знайдено MAGNET')
+      return magnetLink
+    }
+
+    // Якщо magnet немає — використовуємо download.php
+    const downloadLink = $('a[href*="download.php"]').first().attr('href')
 
     if (downloadLink) {
+      console.log('Toloka: знайдено download.php')
+
       return downloadLink.startsWith('http')
         ? downloadLink
         : `${TOLOKA_URL}/${downloadLink}`
     }
+
+    console.log('Toloka: нічого не знайдено')
 
     return null
 
