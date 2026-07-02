@@ -27,133 +27,106 @@ function extractCookies(headers, existingCookies = '') {
 
 async function login(username, password) {
   const client = createClient()
+  const loginPage = await client.get('/login.php')
+  let cookieString = extractCookies(loginPage.headers)
 
-  try {
-    const loginPage = await client.get('/login.php')
-    let cookieString = extractCookies(loginPage.headers)
+  const response = await client.post('/login.php', new URLSearchParams({
+    username,
+    password,
+    login: 'Вхід',
+    redirect: '',
+    autologin: 'on',
+  }), {
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Cookie': cookieString,
+      'Referer': `${TOLOKA_URL}/login.php`,
+    },
+    maxRedirects: 5,
+  })
 
-    const response = await client.post('/login.php', new URLSearchParams({
-      username: username,
-      password: password,
-      login: 'Вхід',
-      redirect: '',
-      autologin: 'on',
-    }), {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Cookie': cookieString,
-        'Referer': `${TOLOKA_URL}/login.php`,
-      },
-      maxRedirects: 5,
-    })
+  cookieString = extractCookies(response.headers, cookieString)
 
-    cookieString = extractCookies(response.headers, cookieString)
+  const $after = cheerio.load(response.data)
+  const isLoggedIn = $after(`a:contains("${username}")`).length > 0 ||
+                     $after('a[href*="logout"]').length > 0
 
-    const $after = cheerio.load(response.data)
-    const isLoggedIn = $after(`a:contains("${username}")`).length > 0 ||
-                       $after('a[href*="logout"]').length > 0
+  if (!isLoggedIn) throw new Error('Невірний логін або пароль Toloka')
 
-    if (!isLoggedIn) {
-      throw new Error('Невірний логін або пароль Toloka')
-    }
-
-    console.log('Toloka: успішний логін')
-    return { cookieString }
-
-  } catch (err) {
-    console.error('Toloka login error:', err.message)
-    throw err
-  }
+  console.log('Toloka: успішний логін')
+  return { cookieString }
 }
 
 async function search(cookieString, query) {
   const client = createClient()
 
-  try {
-    const response = await client.post('/tracker.php', new URLSearchParams({
-      nm: query,
-      submit: 'Пошук',
-    }), {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Cookie': cookieString,
-        'Referer': `${TOLOKA_URL}/tracker.php`,
-      },
+  const response = await client.post('/tracker.php', new URLSearchParams({
+    nm: query,
+    submit: 'Пошук',
+  }), {
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Cookie': cookieString,
+      'Referer': `${TOLOKA_URL}/tracker.php`,
+    },
+  })
+
+  const $ = cheerio.load(response.data)
+  const results = []
+
+  $('a').each((i, el) => {
+    const href = $(el).attr('href') || ''
+    const title = $(el).text().trim()
+    if (!href.match(/^t\d+$/) || title.length < 5) return
+
+    const $row = $(el).closest('tr')
+    let seeders = 0
+    let size = ''
+
+    $row.find('td').each((j, td) => {
+      const text = $(td).text().trim()
+      if (text.match(/^\d+$/) && parseInt(text) < 10000) {
+        seeders = Math.max(seeders, parseInt(text))
+      }
+      if (text.match(/\d+(\.\d+)?\s*(GB|MB)/i)) size = text
     })
 
-    const $ = cheerio.load(response.data)
-    const results = []
-
-    // Посилання мають формат /tXXXXX
-    $('a').each((i, el) => {
-      const href = $(el).attr('href') || ''
-      const title = $(el).text().trim()
-
-      // Фільтруємо тільки посилання на топіки
-      if (!href.match(/^t\d+$/) || title.length < 5) return
-
-      // Знаходимо батьківський рядок таблиці
-      const $row = $(el).closest('tr')
-
-      // Витягуємо сіди і розмір з рядка
-      const cells = $row.find('td')
-      let seeders = 0
-      let size = ''
-
-      cells.each((j, td) => {
-        const text = $(td).text().trim()
-        if (text.match(/^\d+$/) && parseInt(text) < 10000) {
-          seeders = Math.max(seeders, parseInt(text))
-        }
-        if (text.match(/\d+(\.\d+)?\s*(GB|MB)/i)) {
-          size = text
-        }
-      })
-
-      results.push({
-        title,
-        url: `${TOLOKA_URL}/${href}`,
-        seeders,
-        size,
-        source: 'Toloka',
-      })
+    results.push({
+      title,
+      url: `${TOLOKA_URL}/${href}`,
+      seeders,
+      size,
+      source: 'Toloka',
     })
+  })
 
-    console.log(`Toloka: знайдено ${results.length} результатів для "${query}"`)
-    return results
-
-  } catch (err) {
-    console.error('Toloka search error:', err.message)
-    return []
-  }
+  console.log(`Toloka: знайдено ${results.length} результатів для "${query}"`)
+  return results
 }
 
-// Повертає інформацію, достатню щоб побудувати повноцінний torrent-стрім:
-// або готовий magnet-рядок, або реальні байти .torrent файлу.
-// НІКОЛИ не повертає "голий" URL на download.php — Stremio не вміє
-// відкривати його з cookies, тож раніше саме тут була причина
-// "нічого не відтворюється".
+// Повертає { type: 'magnet', magnet } або { type: 'file', buffer }
+// НІКОЛИ не повертає голий URL — Stremio не може відкрити його з cookies
 async function getTorrentInfo(cookieString, torrentUrl) {
   const client = createClient()
 
   try {
-    const response = await client.get(torrentUrl, {
-      headers: { Cookie: cookieString },
+    // 1. Отримуємо сторінку топіку
+    const page = await client.get(torrentUrl, {
+      headers: { 'Cookie': cookieString },
     })
+    const $ = cheerio.load(page.data)
 
-    const $ = cheerio.load(response.data)
-
-    // Спочатку перевіряємо чи є готовий magnet
+    // 2. Якщо є magnet — повертаємо одразу
     const magnetLink = $('a[href^="magnet:"]').first().attr('href')
     if (magnetLink) {
-      console.log('Toloka: знайдено MAGNET')
+      console.log('Toloka: знайдено magnet')
       return { type: 'magnet', magnet: magnetLink }
     }
 
-    // Інакше шукаємо посилання на завантаження .torrent файлу
+    // 3. Знаходимо посилання на download.php
     const downloadHref = $('a[href*="download.php"]').first().attr('href')
     if (!downloadHref) {
-      console.log('Toloka: посилання на завантаження не знайдено')
+      console.log('Toloka: download link не знайдено для', torrentUrl)
       return null
     }
 
@@ -161,34 +134,29 @@ async function getTorrentInfo(cookieString, torrentUrl) {
       ? downloadHref
       : `${TOLOKA_URL}/${downloadHref}`
 
-    // Завантажуємо САМ .torrent файл (бінарно), з тими самими cookies,
-    // на боці аддону — а не віддаємо це посилання в Stremio.
-    // Toloka банить занадто часті запити (429) — при цьому чекаємо і пробуємо ще раз.
-    let torrentResponse
+    // 4. Завантажуємо .torrent файл на боці аддону (з cookies)
+    let torrentResp
     try {
-      torrentResponse = await client.get(downloadUrl, {
-        headers: { Cookie: cookieString },
+      torrentResp = await client.get(downloadUrl, {
+        headers: { 'Cookie': cookieString, 'Referer': torrentUrl },
         responseType: 'arraybuffer',
       })
     } catch (err) {
       if (err.response?.status === 429) {
-        console.log('Toloka: 429, чекаємо 4с і пробуємо ще раз...')
+        console.log('Toloka: 429, чекаємо 4с...')
         await new Promise(r => setTimeout(r, 4000))
-        torrentResponse = await client.get(downloadUrl, {
-          headers: { Cookie: cookieString },
+        torrentResp = await client.get(downloadUrl, {
+          headers: { 'Cookie': cookieString, 'Referer': torrentUrl },
           responseType: 'arraybuffer',
         })
-      } else {
-        throw err
-      }
+      } else throw err
     }
 
-    const buffer = Buffer.from(torrentResponse.data)
+    const buffer = Buffer.from(torrentResp.data)
 
-    // .torrent файл — це bencode-словник, він завжди починається з байта 'd' (0x64).
-    // Якщо це не так — значить cookies недійсні і нам віддали HTML-сторінку логіну.
+    // 5. Валідація: torrent файл завжди починається з 'd' (0x64)
     if (buffer.length === 0 || buffer[0] !== 0x64) {
-      console.error('Toloka: download.php повернув не .torrent файл (ймовірно, недійсні cookies)')
+      console.error('Toloka: download.php повернув не .torrent (можливо, cookies недійсні)')
       return null
     }
 

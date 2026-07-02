@@ -1,4 +1,9 @@
 // src/mazepa.js
+// СТАН: Mazepa блокує хмарні IP (Render, Railway тощо) з кодом 403.
+// Це IP-блокування на рівні сервера — не залежить від credentials чи коду.
+// Login повертає null при 403 — аддон продовжує працювати тільки з Toloka.
+// Коли Mazepa розблокує хмарні IP або буде запущено локально — все запрацює.
+
 const axios = require('axios')
 const cheerio = require('cheerio')
 
@@ -54,20 +59,25 @@ async function login(username, password) {
                        $after('a[href*="logout"]').length > 0 ||
                        $after('a[href*="profile"]').length > 0
 
-    if (!isLoggedIn) {
-      throw new Error('Невірний логін або пароль Mazepa')
-    }
+    if (!isLoggedIn) throw new Error('Невірний логін або пароль Mazepa')
 
     console.log('Mazepa: успішний логін')
     return { cookieString }
 
   } catch (err) {
+    if (err.response?.status === 403) {
+      // IP заблокований хмарним хостингом — не крашимо аддон
+      console.warn('Mazepa: 403 — IP сервера заблокований, Mazepa пропускається')
+      return null
+    }
+    // Інші помилки логуємо але теж повертаємо null щоб не крашити аддон
     console.error('Mazepa login error:', err.message)
-    throw err
+    return null
   }
 }
 
 async function search(cookieString, query) {
+  if (!cookieString) return []
   const client = createClient()
 
   try {
@@ -82,36 +92,31 @@ async function search(cookieString, query) {
     const $ = cheerio.load(response.data)
     const results = []
 
-    console.log('Mazepa search title:', $('title').text())
-    console.log('Mazepa всі посилання з цифрами:')
-
     $('a').each((i, el) => {
       const href = $(el).attr('href') || ''
       const title = $(el).text().trim()
 
-      if (href.match(/^t\d+$/) && title.length > 5) {
-        const $row = $(el).closest('tr')
-        let seeders = 0
-        let size = ''
+      if (!href.match(/^t\d+$/) || title.length < 5) return
 
-        $row.find('td').each((j, td) => {
-          const text = $(td).text().trim()
-          if (text.match(/^\d+$/) && parseInt(text) < 10000) {
-            seeders = Math.max(seeders, parseInt(text))
-          }
-          if (text.match(/\d+(\.\d+)?\s*(GB|MB)/i)) {
-            size = text
-          }
-        })
+      const $row = $(el).closest('tr')
+      let seeders = 0
+      let size = ''
 
-        results.push({
-          title,
-          url: `${MAZEPA_URL}/${href}`,
-          seeders,
-          size,
-          source: 'Mazepa',
-        })
-      }
+      $row.find('td').each((j, td) => {
+        const text = $(td).text().trim()
+        if (text.match(/^\d+$/) && parseInt(text) < 10000) {
+          seeders = Math.max(seeders, parseInt(text))
+        }
+        if (text.match(/\d+(\.\d+)?\s*(GB|MB)/i)) size = text
+      })
+
+      results.push({
+        title,
+        url: `${MAZEPA_URL}/${href}`,
+        seeders,
+        size,
+        source: 'Mazepa',
+      })
     })
 
     console.log(`Mazepa: знайдено ${results.length} результатів для "${query}"`)
@@ -123,35 +128,57 @@ async function search(cookieString, query) {
   }
 }
 
-async function getMagnet(cookieString, torrentUrl) {
+// Повертає { type: 'magnet', magnet } або { type: 'file', buffer }
+async function getTorrentInfo(cookieString, torrentUrl) {
+  if (!cookieString) return null
   const client = createClient()
 
   try {
-    const response = await client.get(torrentUrl, {
+    const page = await client.get(torrentUrl, {
       headers: { 'Cookie': cookieString },
     })
+    const $ = cheerio.load(page.data)
 
-    const $ = cheerio.load(response.data)
-
+    // Спочатку magnet
     const magnet = $('a[href^="magnet:"]').first().attr('href')
-    if (magnet) return magnet
+    if (magnet) {
+      console.log('Mazepa: знайдено magnet')
+      return { type: 'magnet', magnet }
+    }
 
-    const downloadLink = $('a[href*="download.php"]').first().attr('href') ||
+    // Потім download посилання
+    const downloadHref = $('a[href*="download.php"]').first().attr('href') ||
                          $('a[href*=".torrent"]').first().attr('href') ||
                          $('a[title*="завантажити" i]').first().attr('href')
 
-    if (downloadLink) {
-      return downloadLink.startsWith('http')
-        ? downloadLink
-        : `${MAZEPA_URL}/${downloadLink}`
+    if (!downloadHref) {
+      console.log('Mazepa: download link не знайдено')
+      return null
     }
 
-    return null
+    const downloadUrl = downloadHref.startsWith('http')
+      ? downloadHref
+      : `${MAZEPA_URL}/${downloadHref}`
+
+    const torrentResp = await client.get(downloadUrl, {
+      headers: { 'Cookie': cookieString, 'Referer': torrentUrl },
+      responseType: 'arraybuffer',
+    })
+
+    const buffer = Buffer.from(torrentResp.data)
+
+    if (buffer.length === 0 || buffer[0] !== 0x64) {
+      console.error('Mazepa: download повернув не .torrent файл')
+      return null
+    }
+
+    console.log(`Mazepa: отримано .torrent файл (${buffer.length} байт)`)
+    return { type: 'file', buffer }
 
   } catch (err) {
-    console.error('Mazepa getMagnet error:', err.message)
+    console.error('Mazepa getTorrentInfo error:', err.message)
     return null
   }
 }
 
-module.exports = { login, search, getMagnet }
+module.exports = { login, search, getTorrentInfo }
