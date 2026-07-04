@@ -221,3 +221,13 @@ server.listen(PORT, () => {
   console.log(`Відкрий в браузері: http://localhost:${PORT}`)
   console.log(`Налаштуй credentials та встанови в Stremio\n`)
 })
+
+// Запобіжник: одна необроблена помилка не повинна класти весь сервер.
+// Без цього, наприклад, розрив з'єднання під час стрімінгу відео
+// може перезапустити весь процес і скинути кеш активних торрентів.
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ Uncaught Exception (сервер продовжує роботу):', err.message)
+})
+process.on('unhandledRejection', (err) => {
+  console.error('⚠️ Unhandled Rejection (сервер продовжує роботу):', err?.message || err)
+})
