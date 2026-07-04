@@ -1,7 +1,8 @@
 // index.js
-const { serveHTTP } = require('stremio-addon-sdk')
 const { buildAddon } = require('./src/addon')
-const { encodeConfig, decodeConfig, defaultConfig } = require('./src/config')
+const { decodeConfig } = require('./src/config')
+const torrentCache = require('./src/torrentCache')
+const { handleStreamRequest } = require('./src/streamServer')
 const http = require('http')
 
 const PORT = process.env.PORT || 7000
@@ -149,16 +150,34 @@ function configPage() {
 }
 
 const server = http.createServer(async (req, res) => {
-  // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Access-Control-Allow-Headers', '*')
 
   const url = req.url.split('?')[0]
+  const baseUrl = `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host}`
 
   // Головна сторінка
   if (url === '/' || url === '/configure') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
     res.end(configPage())
+    return
+  }
+
+  // Стрім-проксі: /watch/<infoHash>/<fileIdx>.mp4
+  const watchMatch = url.match(/^\/watch\/([a-fA-F0-9]{40})\/(\d+)\.mp4$/)
+  if (watchMatch) {
+    const infoHash = watchMatch[1].toLowerCase()
+    const fileIdx = parseInt(watchMatch[2], 10)
+
+    const buffer = torrentCache.get(infoHash)
+    if (!buffer) {
+      console.error(`Watch: буфер для ${infoHash} не знайдено в кеші (можливо, застарів)`)
+      res.writeHead(404)
+      res.end('Torrent expired, please reload streams in Stremio')
+      return
+    }
+
+    await handleStreamRequest(req, res, buffer, infoHash, fileIdx)
     return
   }
 
@@ -168,16 +187,14 @@ const server = http.createServer(async (req, res) => {
     const encoded = match[1]
     const path = match[2]
     const config = decodeConfig(encoded)
-    const addonInterface = buildAddon(config)
+    const addonInterface = buildAddon(config, baseUrl)
 
-    // Розбираємо шлях
     if (path === 'manifest.json') {
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(addonInterface.manifest))
       return
     }
 
-    // stream/movie/tt1234567.json
     const streamMatch = path.match(/^stream\/(\w+)\/(.+)\.json$/)
     if (streamMatch) {
       const type = streamMatch[1]

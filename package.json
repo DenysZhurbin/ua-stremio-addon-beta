@@ -1,6 +1,6 @@
 {
   "name": "ua-stremio-addon",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -13,6 +13,7 @@
     "axios": "^1.6.0",
     "cheerio": "^1.0.0",
     "parse-torrent": "^11.0.21",
-    "stremio-addon-sdk": "^1.6.10"
+    "stremio-addon-sdk": "^1.6.10",
+    "webtorrent": "^1.9.7"
   }
 }

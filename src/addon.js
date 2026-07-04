@@ -3,10 +3,11 @@ const { addonBuilder } = require('stremio-addon-sdk')
 const axios = require('axios')
 const toloka = require('./toloka')
 const mazepa = require('./mazepa')
+const torrentCache = require('./torrentCache')
 
 const manifest = {
   id: 'ua.stremio.addon',
-  version: '1.0.0',
+  version: '2.0.0',
   name: '🇺🇦 UA Torrents',
   description: 'Українські торренти з Toloka та Mazepa з українським озвученням',
   types: ['movie', 'series'],
@@ -15,7 +16,6 @@ const manifest = {
   idPrefixes: ['tt'],
 }
 
-// Кеш сесій — не логінимось на кожен запит
 const sessionCache = new Map()
 
 async function getSession(source, login, password) {
@@ -38,7 +38,7 @@ async function getSession(source, login, password) {
   return session
 }
 
-// parse-torrent — ESM пакет, підключаємо через dynamic import один раз
+// parse-torrent — ESM пакет, підключаємо через dynamic import
 let _parseTorrent = null
 async function getParseTorrent() {
   if (!_parseTorrent) {
@@ -48,8 +48,6 @@ async function getParseTorrent() {
   return _parseTorrent
 }
 
-// Приймає { type: 'magnet'|'file', magnet?, buffer? }
-// Повертає { infoHash, announce, files } або null
 async function parseTorrentInfo(info) {
   try {
     const parseTorrent = await getParseTorrent()
@@ -61,7 +59,6 @@ async function parseTorrentInfo(info) {
   }
 }
 
-// Обираємо індекс найбільшого відеофайлу в торренті
 function pickVideoFileIdx(files) {
   if (!Array.isArray(files) || files.length <= 1) return undefined
   const videoExt = /\.(mp4|mkv|avi|mov|webm|m4v|ts)$/i
@@ -78,14 +75,15 @@ function pickVideoFileIdx(files) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
-async function resultsToStreams(results, cookieString, source) {
+// baseUrl потрібен щоб побудувати повний URL на наш власний
+// стрім-ендпоінт (/watch/<infoHash>/<fileIdx>.mp4)
+async function resultsToStreams(results, cookieString, source, baseUrl) {
   const streams = []
   const topResults = results.sort((a, b) => b.seeders - a.seeders).slice(0, 5)
 
   let isFirst = true
   for (const result of topResults) {
     try {
-      // Пауза між запитами щоб не отримати 429
       if (!isFirst) await sleep(2500)
       isFirst = false
 
@@ -95,32 +93,41 @@ async function resultsToStreams(results, cookieString, source) {
 
       if (!info) continue
 
+      // Тільки .torrent-файли можемо проксувати (потребують передачі буфера).
+      // Magnet-посилання без токена для приватного трекера все одно
+      // не спрацюють через наш проксі так само як напряму в Stremio,
+      // тому обробляємо тільки type: 'file'.
+      if (info.type !== 'file') {
+        console.log(`Пропускаємо magnet (не підтримується проксі): ${result.title}`)
+        continue
+      }
+
       const parsed = await parseTorrentInfo(info)
       if (!parsed?.infoHash) {
         console.error(`infoHash не отримано для "${result.title}"`)
         continue
       }
 
+      // Кешуємо .torrent буфер щоб віддати його при реальному запиті відео
+      torrentCache.set(parsed.infoHash, info.buffer)
+
+      const fileIdx = pickVideoFileIdx(parsed.files)
       const quality = result.title.match(/4K|2160p|1080p|720p|480p/i)?.[0] || 'HD'
       const flag = source === 'toloka' ? '🇺🇦 Toloka' : '🇺🇦 Mazepa'
 
-      // Трекери з torrent файлу як підказка для Stremio
-      const sources = (parsed.announce || [])
-        .filter(a => a.startsWith('http') || a.startsWith('udp'))
-        .map(t => `tracker:${t}`)
+      const watchUrl = `${baseUrl}/watch/${parsed.infoHash}/${fileIdx ?? 0}.mp4`
 
       streams.push({
         name: flag,
         title: `${result.title}\n${quality} | ${result.size} | 👥 ${result.seeders}`,
-        infoHash: parsed.infoHash,
-        fileIdx: pickVideoFileIdx(parsed.files),
-        sources,
+        url: watchUrl,
         behaviorHints: {
           bingeGroup: `ua-addon-${source}`,
+          notWebReady: true,
         },
       })
 
-      console.log(`✅ Stream додано: ${parsed.infoHash} | ${result.title.substring(0, 50)}`)
+      console.log(`✅ Stream додано: ${result.title.substring(0, 50)}`)
     } catch (err) {
       console.error(`Помилка для "${result.title}":`, err.message)
     }
@@ -129,14 +136,13 @@ async function resultsToStreams(results, cookieString, source) {
   return streams
 }
 
-function buildAddon(config) {
+function buildAddon(config, baseUrl) {
   const builder = new addonBuilder(manifest)
 
   builder.defineStreamHandler(async ({ type, id }) => {
     console.log(`\n▶ Запит стрімів: ${type} ${id}`)
     const streams = []
 
-    // Серіали: id = "tt1234567:сезон:епізод"
     const [imdbId, season, episode] = id.split(':')
 
     let searchQuery
@@ -167,7 +173,7 @@ function buildAddon(config) {
           .then(session => {
             if (!session) return
             return toloka.search(session.cookieString, searchQuery)
-              .then(results => resultsToStreams(results, session.cookieString, 'toloka'))
+              .then(results => resultsToStreams(results, session.cookieString, 'toloka', baseUrl))
               .then(s => streams.push(...s))
           })
           .catch(err => console.error('Toloka task error:', err.message))
@@ -178,9 +184,9 @@ function buildAddon(config) {
       tasks.push(
         getSession('mazepa', config.mazepaLogin, config.mazepaPassword)
           .then(session => {
-            if (!session) return  // null = 403 або інша помилка — пропускаємо
+            if (!session) return
             return mazepa.search(session.cookieString, searchQuery)
-              .then(results => resultsToStreams(results, session.cookieString, 'mazepa'))
+              .then(results => resultsToStreams(results, session.cookieString, 'mazepa', baseUrl))
               .then(s => streams.push(...s))
           })
           .catch(err => console.error('Mazepa task error:', err.message))
