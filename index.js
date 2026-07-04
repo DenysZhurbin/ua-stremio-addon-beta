@@ -198,7 +198,10 @@ const server = http.createServer(async (req, res) => {
     const streamMatch = path.match(/^stream\/(\w+)\/(.+)\.json$/)
     if (streamMatch) {
       const type = streamMatch[1]
-      const id = streamMatch[2]
+      // Stremio кодує id в URL (наприклад ":" стає "%3A" для серіалів
+      // формату tt123:сезон:епізод) — без декодування розбір season/episode
+      // в addon.js ламається і серіали не працюють
+      const id = decodeURIComponent(streamMatch[2])
       try {
         const result = await addonInterface.get('stream', type, id)
         res.writeHead(200, { 'Content-Type': 'application/json' })

@@ -146,22 +146,30 @@ function buildAddon(config, baseUrl) {
     const [imdbId, season, episode] = id.split(':')
 
     let searchQuery
-    try {
-      const meta = await axios.get(
-        `https://v3-cinemeta.strem.io/meta/${type}/${imdbId}.json`,
-        { timeout: 8000 }
-      )
-      searchQuery = meta.data?.meta?.name
-      if (season && episode) {
-        const s = String(season).padStart(2, '0')
-        const e = String(episode).padStart(2, '0')
-        searchQuery = `${searchQuery} S${s}E${e}`
+    // Render free tier "засинає" після неактивності і холодний старт
+    // може займати 30-60с — перший запит до зовнішнього API інколи
+    // встигає впасти по таймауту саме через це. Одна повторна спроба
+    // з більшим таймаутом вирішує більшість таких випадків.
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const meta = await axios.get(
+          `https://v3-cinemeta.strem.io/meta/${type}/${imdbId}.json`,
+          { timeout: attempt === 1 ? 8000 : 15000 }
+        )
+        searchQuery = meta.data?.meta?.name
+        break
+      } catch (err) {
+        console.error(`Cinemeta error (спроба ${attempt}):`, err.message || 'unknown')
+        if (attempt === 2) return { streams: [] }
       }
-      console.log(`Шукаємо: "${searchQuery}"`)
-    } catch (err) {
-      console.error('Cinemeta error:', err.message)
-      return { streams: [] }
     }
+
+    if (season && episode) {
+      const s = String(season).padStart(2, '0')
+      const e = String(episode).padStart(2, '0')
+      searchQuery = `${searchQuery} S${s}E${e}`
+    }
+    console.log(`Шукаємо: "${searchQuery}"`)
 
     if (!searchQuery) return { streams: [] }
 

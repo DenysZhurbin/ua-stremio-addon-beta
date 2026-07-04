@@ -11,9 +11,22 @@
 const WebTorrent = require('webtorrent')
 const { pipeline } = require('stream')
 
-const client = new WebTorrent()
+// DHT/LSD/NAT-traversal вимкнені навмисно:
+//   - Toloka — приватний трекер, піри доступні ТІЛЬКИ через
+//     announce URL з персональним токеном, DHT там нічого не знайде
+//   - WebTorrent з увімкненим DHT відкриває десятки UDP-портів
+//     (пошук по всій мережі), через що Render.com попереджав
+//     "Detected more than the maximum number (75) of ports" і,
+//     судячи з періодичних рестартів контейнера в логах, це й
+//     було причиною нестабільної/повільної роботи
+const client = new WebTorrent({
+  dht: false,
+  lsd: false,
+  natUpnp: false,
+  natPmp: false,
+  webSeeds: false,
+})
 
-// На всяк випадок ловимо помилки самого клієнта, щоб вони не валили процес
 client.on('error', err => {
   console.error('WebTorrent client error:', err.message)
 })
@@ -49,7 +62,10 @@ function addTorrent(torrentBuffer, infoHash) {
 
     let torrent
     try {
-      torrent = client.add(torrentBuffer, t => {
+      // maxWebConns обмежує кількість одночасних TCP/UDP з'єднань —
+      // для приватного трекера з невеликою кількістю сідів цього
+      // достатньо і це додатково зменшує навантаження на порти
+      torrent = client.add(torrentBuffer, { maxWebConns: 20 }, t => {
         console.log(`StreamServer: торрент додано, файлів: ${t.files.length}`)
         activeTorrents.set(infoHash, { torrent: t })
         scheduleCleanup(infoHash)
