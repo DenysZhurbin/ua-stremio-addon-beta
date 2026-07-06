@@ -15,10 +15,8 @@ const { pipeline } = require('stream')
 //   - Toloka — приватний трекер, піри доступні ТІЛЬКИ через
 //     announce URL з персональним токеном, DHT там нічого не знайде
 //   - WebTorrent з увімкненим DHT відкриває десятки UDP-портів
-//     (пошук по всій мережі), через що Render.com попереджав
-//     "Detected more than the maximum number (75) of ports" і,
-//     судячи з періодичних рестартів контейнера в логах, це й
-//     було причиною нестабільної/повільної роботи
+//     через що Render.com попереджав про ліміт портів і, судячи
+//     з логів, перезапускав контейнер
 const client = new WebTorrent({
   dht: false,
   lsd: false,
@@ -31,55 +29,99 @@ client.on('error', err => {
   console.error('WebTorrent client error:', err.message)
 })
 
-const activeTorrents = new Map()
-const IDLE_TIMEOUT = 30 * 60 * 1000
+// Render free tier має тільки 512MB RAM. Кожен активний торрент тримає
+// піри, буфери шматків і відкриті з'єднання — кілька одночасних торрентів
+// (наприклад, юзер за 20 хв "потикав" 4-5 різних фільмів) можуть вичерпати
+// пам'ять і призвести до OOM-рестарту процесу (саме це й спостерігалось:
+// сервер "падав через якийсь час"). Тому:
+//   - тримаємо не більше MAX_CONCURRENT торрентів одночасно (LRU-витіснення)
+//   - і чистимо неактивні набагато швидше (10 хв замість 30)
+const MAX_CONCURRENT_TORRENTS = 2
+const IDLE_TIMEOUT = 10 * 60 * 1000
+
+const activeTorrents = new Map() // infoHash -> { torrent, cleanupTimer, lastUsed }
+const pendingAdds = new Map()    // infoHash -> Promise (захист від подвійного client.add при паралельних Range-запитах)
+
+function destroyTorrent(infoHash, reason) {
+  const entry = activeTorrents.get(infoHash)
+  if (!entry) return
+  console.log(`StreamServer: прибираємо торрент ${infoHash} (${reason})`)
+  if (entry.cleanupTimer) clearTimeout(entry.cleanupTimer)
+  const torrent = client.get(infoHash)
+  if (torrent) torrent.destroy()
+  activeTorrents.delete(infoHash)
+}
 
 function scheduleCleanup(infoHash) {
   const entry = activeTorrents.get(infoHash)
   if (!entry) return
+  entry.lastUsed = Date.now()
   if (entry.cleanupTimer) clearTimeout(entry.cleanupTimer)
-  entry.cleanupTimer = setTimeout(() => {
-    console.log(`StreamServer: прибираємо неактивний торрент ${infoHash}`)
-    const torrent = client.get(infoHash)
-    if (torrent) torrent.destroy()
-    activeTorrents.delete(infoHash)
-  }, IDLE_TIMEOUT)
+  entry.cleanupTimer = setTimeout(() => destroyTorrent(infoHash, 'неактивний 10 хв'), IDLE_TIMEOUT)
+}
+
+// Якщо перевищено ліміт одночасних торрентів — прибираємо найдавніше
+// використаний, щоб звільнити пам'ять під новий
+function evictOldestIfNeeded() {
+  if (activeTorrents.size < MAX_CONCURRENT_TORRENTS) return
+  let oldestHash = null
+  let oldestTime = Infinity
+  for (const [hash, entry] of activeTorrents) {
+    if (entry.lastUsed < oldestTime) {
+      oldestTime = entry.lastUsed
+      oldestHash = hash
+    }
+  }
+  if (oldestHash) destroyTorrent(oldestHash, 'ліміт одночасних торрентів')
 }
 
 function addTorrent(torrentBuffer, infoHash) {
-  return new Promise((resolve, reject) => {
-    if (activeTorrents.has(infoHash)) {
-      scheduleCleanup(infoHash)
-      return resolve(activeTorrents.get(infoHash).torrent)
-    }
+  if (activeTorrents.has(infoHash)) {
+    scheduleCleanup(infoHash)
+    return Promise.resolve(activeTorrents.get(infoHash).torrent)
+  }
 
+  // Захист від race condition: два паралельних Range-запити на той самий
+  // фільм (браузер/Stremio так роблять під час буферизації) можуть обидва
+  // потрапити сюди до того як перший встигне записати в activeTorrents
+  if (pendingAdds.has(infoHash)) {
+    return pendingAdds.get(infoHash)
+  }
+
+  const promise = new Promise((resolve, reject) => {
     const existing = client.get(infoHash)
     if (existing) {
-      activeTorrents.set(infoHash, { torrent: existing })
+      activeTorrents.set(infoHash, { torrent: existing, lastUsed: Date.now() })
       scheduleCleanup(infoHash)
+      pendingAdds.delete(infoHash)
       return resolve(existing)
     }
 
+    evictOldestIfNeeded()
+
     let torrent
     try {
-      // maxWebConns обмежує кількість одночасних TCP/UDP з'єднань —
-      // для приватного трекера з невеликою кількістю сідів цього
-      // достатньо і це додатково зменшує навантаження на порти
       torrent = client.add(torrentBuffer, { maxWebConns: 20 }, t => {
-        console.log(`StreamServer: торрент додано, файлів: ${t.files.length}`)
-        activeTorrents.set(infoHash, { torrent: t })
+        console.log(`StreamServer: торрент додано, файлів: ${t.files.length} (активних торрентів: ${activeTorrents.size + 1})`)
+        activeTorrents.set(infoHash, { torrent: t, lastUsed: Date.now() })
         scheduleCleanup(infoHash)
+        pendingAdds.delete(infoHash)
         resolve(t)
       })
     } catch (err) {
+      pendingAdds.delete(infoHash)
       return reject(err)
     }
 
     torrent.on('error', err => {
       console.error('StreamServer torrent error:', err.message)
+      pendingAdds.delete(infoHash)
       reject(err)
     })
   })
+
+  pendingAdds.set(infoHash, promise)
+  return promise
 }
 
 function pickVideoFile(torrent, fileIdx) {
@@ -103,8 +145,6 @@ function pickVideoFile(torrent, fileIdx) {
 async function handleStreamRequest(req, res, torrentBuffer, infoHash, fileIdx) {
   let fileStream = null
 
-  // Якщо клієнт (Stremio) закриває з'єднання достроково — просто
-  // прибираємо read-стрім, це нормальна поведінка, не помилка сервера
   const onClientClose = () => {
     if (fileStream && !fileStream.destroyed) {
       fileStream.destroy()
@@ -149,13 +189,10 @@ async function handleStreamRequest(req, res, torrentBuffer, infoHash, fileIdx) {
 
     fileStream = file.createReadStream({ start, end })
 
-    // pipeline сам коректно обробляє помилки з обох боків (readStream і res)
-    // і не кидає необроблений 'error', на відміну від .pipe()
     pipeline(fileStream, res, (err) => {
       if (err && err.code !== 'ERR_STREAM_PREMATURE_CLOSE' && err.code !== 'PREMATURE_CLOSE') {
         console.error('Stream pipeline error:', err.message)
       }
-      // Прибираємо обробник щоб не накопичувались листенери
       req.removeListener('close', onClientClose)
     })
 
