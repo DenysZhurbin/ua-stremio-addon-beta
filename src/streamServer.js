@@ -196,6 +196,27 @@ function pickVideoFile(torrent, fileIdx) {
   return best || torrent.files[0]
 }
 
+// КРИТИЧНО: за замовчуванням WebTorrent вважає ВСІ файли торренту
+// "selected" і намагається завантажити їх усі одночасно. Для season-паку
+// з Toloka (напр. 36 файлів — цілий сезон) це означає паралельне
+// стягування ВСІХ епізодів одночасно замість одного потрібного —
+// саме це й спричиняло безперервне зростання RAM (кожен епізод — свій
+// потік мережевих буферів) і множення портів (пірів на кожен файл),
+// навіть попри private:true і downloadLimit. Виправлення: явно
+// прибираємо пріоритет з усіх файлів і залишаємо тільки потрібний.
+function restrictToSingleFile(torrent, fileIdx) {
+  if (torrent.files.length <= 1) return // нема сенсу для однофайлових релізів
+  if (torrent._uaRestrictedTo === fileIdx) return // вже налаштовано саме на цей файл
+
+  // deselect(0, останній шматок, false) — знімає пріоритет з усього торренту
+  torrent.deselect(0, torrent.pieces.length - 1, false)
+  // і одразу вибираємо тільки потрібний файл назад
+  torrent.files[fileIdx].select()
+
+  torrent._uaRestrictedTo = fileIdx
+  console.log(`StreamServer: обмежено завантаження до файлу [${fileIdx}] "${torrent.files[fileIdx].name}" (з ${torrent.files.length})`)
+}
+
 // Обробляє HTTP-запит на стрімінг з підтримкою Range.
 // КРИТИЧНО: усі read-стріми повинні мати обробник 'error', інакше
 // необроблена помилка (напр. клієнт розірвав з'єднання) валить
@@ -220,6 +241,11 @@ async function handleStreamRequest(req, res, torrentBuffer, infoHash, fileIdx) {
       res.end('Video file not found in torrent')
       return
     }
+
+    // Знаходимо реальний індекс обраного файлу (fileIdx міг бути undefined,
+    // якщо pickVideoFile сама обирала найбільший файл)
+    const actualFileIdx = torrent.files.indexOf(file)
+    restrictToSingleFile(torrent, actualFileIdx)
 
     const range = req.headers.range
     const fileSize = file.length
