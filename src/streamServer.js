@@ -10,6 +10,25 @@
 
 const WebTorrent = require('webtorrent')
 const { pipeline } = require('stream')
+const os = require('os')
+const path = require('path')
+const fs = require('fs')
+
+// КРИТИЧНО: без опції `path` WebTorrent зберігає всі завантажені шматки
+// файлу В ОПЕРАТИВНІЙ ПАМ'ЯТІ (MemoryChunkStore) і ніколи їх не звільняє
+// по мірі перегляду. Для великого відео (кілька GB) це неминуче з'їдає
+// всю доступну RAM за кілька хвилин перегляду — саме це й спричиняло
+// краш процесу на Render (512MB ліміту) з незрозумілою причиною
+// ("Cause of failure could not be determined" = SIGKILL від OOM,
+// його неможливо перехопити на рівні коду).
+// Рішення: писати шматки на диск (ephemeral storage є навіть на
+// безкоштовному Render) і чистити файли при видаленні торренту.
+const DOWNLOAD_PATH = path.join(os.tmpdir(), 'ua-stremio-torrents')
+try {
+  fs.mkdirSync(DOWNLOAD_PATH, { recursive: true })
+} catch (err) {
+  console.error('Не вдалось створити папку для torrent-даних:', err.message)
+}
 
 // DHT/LSD/NAT-traversal вимкнені навмисно:
 //   - Toloka — приватний трекер, піри доступні ТІЛЬКИ через
@@ -48,7 +67,14 @@ function destroyTorrent(infoHash, reason) {
   console.log(`StreamServer: прибираємо торрент ${infoHash} (${reason})`)
   if (entry.cleanupTimer) clearTimeout(entry.cleanupTimer)
   const torrent = client.get(infoHash)
-  if (torrent) torrent.destroy()
+  if (torrent) {
+    // destroyStore: true — видаляє завантажені файли з диску, інакше
+    // ephemeral storage на Render поступово заповниться сміттям від
+    // переглянутих раніше фільмів
+    torrent.destroy({ destroyStore: true }, err => {
+      if (err) console.error(`Помилка видалення файлів торренту ${infoHash}:`, err.message)
+    })
+  }
   activeTorrents.delete(infoHash)
 }
 
@@ -101,7 +127,8 @@ function addTorrent(torrentBuffer, infoHash) {
 
     let torrent
     try {
-      torrent = client.add(torrentBuffer, { maxWebConns: 20 }, t => {
+      // path — пише завантажені шматки на диск замість накопичення в RAM
+      torrent = client.add(torrentBuffer, { path: DOWNLOAD_PATH, maxWebConns: 20 }, t => {
         console.log(`StreamServer: торрент додано, файлів: ${t.files.length} (активних торрентів: ${activeTorrents.size + 1})`)
         activeTorrents.set(infoHash, { torrent: t, lastUsed: Date.now() })
         scheduleCleanup(infoHash)
