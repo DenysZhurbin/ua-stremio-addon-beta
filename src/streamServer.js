@@ -127,8 +127,18 @@ function addTorrent(torrentBuffer, infoHash) {
 
     let torrent
     try {
-      // path — пише завантажені шматки на диск замість накопичення в RAM
-      torrent = client.add(torrentBuffer, { path: DOWNLOAD_PATH, maxWebConns: 20 }, t => {
+      // private: true — КЛЮЧОВЕ виправлення. Файли .torrent з Toloka не
+      // мають прапору "private" у метаданих (перевірено окремо), тому
+      // WebTorrent вважає торрент публічним і сам додає купу публічних
+      // UDP-трекерів (global.WEBTORRENT_ANNOUNCE) у спробах знайти пірів,
+      // яких там фізично немає — саме це відкривало 75+ портів і викликало
+      // попередження/рестарти від Render. Toloka — приватний трекер:
+      // піри існують ТІЛЬКИ через наш announce URL з токеном.
+      torrent = client.add(torrentBuffer, {
+        path: DOWNLOAD_PATH,
+        maxWebConns: 20,
+        private: true,
+      }, t => {
         console.log(`StreamServer: торрент додано, файлів: ${t.files.length} (активних торрентів: ${activeTorrents.size + 1})`)
         activeTorrents.set(infoHash, { torrent: t, lastUsed: Date.now() })
         scheduleCleanup(infoHash)
