@@ -7,7 +7,7 @@ const torrentCache = require('./torrentCache')
 
 const manifest = {
   id: 'ua.stremio.addon',
-  version: '2.0.0',
+  version: '2.1.0',
   name: '🇺🇦 UA Torrents',
   description: 'Українські торренти з Toloka та Mazepa з українським озвученням',
   types: ['movie', 'series'],
@@ -38,7 +38,6 @@ async function getSession(source, login, password) {
   return session
 }
 
-// parse-torrent — ESM пакет, підключаємо через dynamic import
 let _parseTorrent = null
 async function getParseTorrent() {
   if (!_parseTorrent) {
@@ -59,25 +58,64 @@ async function parseTorrentInfo(info) {
   }
 }
 
-function pickVideoFileIdx(files) {
-  if (!Array.isArray(files) || files.length <= 1) return undefined
+// Toloka пакує серіали ЦІЛИМИ СЕЗОНАМИ (напр. "Сезон 1-4"), а не окремими
+// епізодами — рядка "S01E01" в назвах роздач просто не існує. Тому:
+//   1) шукаємо тільки по назві серіалу (без сезону/епізоду)
+//   2) серед знайдених роздач пріоритизуємо ті, що згадують потрібний сезон
+//   3) конкретний епізод шукаємо вже всередині файлів торренту
+function titleMatchesSeason(title, season) {
+  if (!season) return true
+  const s = parseInt(season, 10)
+
+  // "Сезон 3", "Season 3", "S3", "С3"
+  if (new RegExp(`(?:Сезон|Season|С)\\.?\\s*0*${s}(?!\\d)`, 'i').test(title)) return true
+
+  // Діапазон: "Сезони 1-4", "Seasons 1-4", "Сезон 1-2"
+  const rangeMatch = title.match(/(?:Сезон[иі]?|Seasons?)\.?\s*(\d+)\s*[-–]\s*(\d+)/i)
+  if (rangeMatch) {
+    const start = parseInt(rangeMatch[1], 10)
+    const end = parseInt(rangeMatch[2], 10)
+    if (s >= start && s <= end) return true
+  }
+
+  return false
+}
+
+// Якщо є кілька файлів у торренті (сезон з багатьма серіями) — шукаємо
+// файл що відповідає конкретному епізоду за назвою файлу
+function pickVideoFileIdx(files, episode) {
+  if (!Array.isArray(files) || files.length === 0) return undefined
+  if (files.length === 1) return undefined
+
   const videoExt = /\.(mp4|mkv|avi|mov|webm|m4v|ts)$/i
-  let bestIdx
-  let bestSize = -1
-  files.forEach((file, idx) => {
-    if (videoExt.test(file.name) && file.length > bestSize) {
-      bestSize = file.length
-      bestIdx = idx
+  const videoFiles = files
+    .map((f, idx) => ({ ...f, idx }))
+    .filter(f => videoExt.test(f.name))
+
+  if (episode) {
+    const e = parseInt(episode, 10)
+    const patterns = [
+      new RegExp(`[Ss]0*\\d+[Ee]0*${e}(?!\\d)`),           // S01E05
+      new RegExp(`[Ee]p?\\.?\\s*0*${e}(?!\\d)`, 'i'),        // E05, Ep 05, Episode 05
+      new RegExp(`(?:^|[^\\d])0*${e}(?!\\d)\\s*(?:серія|episode)`, 'i'), // "5 серія"
+    ]
+    for (const pattern of patterns) {
+      const found = videoFiles.find(f => pattern.test(f.name))
+      if (found) return found.idx
     }
-  })
-  return bestIdx
+  }
+
+  // Не знайшли конкретний епізод — повертаємо найбільший файл
+  let best = videoFiles[0]
+  for (const f of videoFiles) {
+    if (f.length > best.length) best = f
+  }
+  return best?.idx
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
-// baseUrl потрібен щоб побудувати повний URL на наш власний
-// стрім-ендпоінт (/watch/<infoHash>/<fileIdx>.mp4)
-async function resultsToStreams(results, cookieString, source, baseUrl) {
+async function resultsToStreams(results, cookieString, source, baseUrl, episode) {
   const streams = []
   const topResults = results.sort((a, b) => b.seeders - a.seeders).slice(0, 5)
 
@@ -93,10 +131,6 @@ async function resultsToStreams(results, cookieString, source, baseUrl) {
 
       if (!info) continue
 
-      // Тільки .torrent-файли можемо проксувати (потребують передачі буфера).
-      // Magnet-посилання без токена для приватного трекера все одно
-      // не спрацюють через наш проксі так само як напряму в Stremio,
-      // тому обробляємо тільки type: 'file'.
       if (info.type !== 'file') {
         console.log(`Пропускаємо magnet (не підтримується проксі): ${result.title}`)
         continue
@@ -108,10 +142,9 @@ async function resultsToStreams(results, cookieString, source, baseUrl) {
         continue
       }
 
-      // Кешуємо .torrent буфер щоб віддати його при реальному запиті відео
       torrentCache.set(parsed.infoHash, info.buffer)
 
-      const fileIdx = pickVideoFileIdx(parsed.files)
+      const fileIdx = pickVideoFileIdx(parsed.files, episode)
       const quality = result.title.match(/4K|2160p|1080p|720p|480p/i)?.[0] || 'HD'
       const flag = source === 'toloka' ? '🇺🇦 Toloka' : '🇺🇦 Mazepa'
 
@@ -145,18 +178,14 @@ function buildAddon(config, baseUrl) {
 
     const [imdbId, season, episode] = id.split(':')
 
-    let searchQuery
-    // Render free tier "засинає" після неактивності і холодний старт
-    // може займати 30-60с — перший запит до зовнішнього API інколи
-    // встигає впасти по таймауту саме через це. Одна повторна спроба
-    // з більшим таймаутом вирішує більшість таких випадків.
+    let title
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         const meta = await axios.get(
           `https://v3-cinemeta.strem.io/meta/${type}/${imdbId}.json`,
           { timeout: attempt === 1 ? 8000 : 15000 }
         )
-        searchQuery = meta.data?.meta?.name
+        title = meta.data?.meta?.name
         break
       } catch (err) {
         console.error(`Cinemeta error (спроба ${attempt}):`, err.message || 'unknown')
@@ -164,14 +193,10 @@ function buildAddon(config, baseUrl) {
       }
     }
 
-    if (season && episode) {
-      const s = String(season).padStart(2, '0')
-      const e = String(episode).padStart(2, '0')
-      searchQuery = `${searchQuery} S${s}E${e}`
-    }
-    console.log(`Шукаємо: "${searchQuery}"`)
+    if (!title) return { streams: [] }
 
-    if (!searchQuery) return { streams: [] }
+    // Пошук тільки по назві — БЕЗ S01E01, бо Toloka пакує серіали сезонами
+    console.log(`Шукаємо: "${title}"${season ? ` (сезон ${season}, епізод ${episode})` : ''}`)
 
     const tasks = []
 
@@ -180,8 +205,16 @@ function buildAddon(config, baseUrl) {
         getSession('toloka', config.tolokaLogin, config.tolokaPassword)
           .then(session => {
             if (!session) return
-            return toloka.search(session.cookieString, searchQuery)
-              .then(results => resultsToStreams(results, session.cookieString, 'toloka', baseUrl))
+            return toloka.search(session.cookieString, title)
+              .then(results => {
+                if (season) {
+                  const filtered = results.filter(r => titleMatchesSeason(r.title, season))
+                  console.log(`Toloka: ${filtered.length}/${results.length} роздач відповідають сезону ${season}`)
+                  return filtered.length > 0 ? filtered : results
+                }
+                return results
+              })
+              .then(results => resultsToStreams(results, session.cookieString, 'toloka', baseUrl, episode))
               .then(s => streams.push(...s))
           })
           .catch(err => console.error('Toloka task error:', err.message))
@@ -193,8 +226,15 @@ function buildAddon(config, baseUrl) {
         getSession('mazepa', config.mazepaLogin, config.mazepaPassword)
           .then(session => {
             if (!session) return
-            return mazepa.search(session.cookieString, searchQuery)
-              .then(results => resultsToStreams(results, session.cookieString, 'mazepa', baseUrl))
+            return mazepa.search(session.cookieString, title)
+              .then(results => {
+                if (season) {
+                  const filtered = results.filter(r => titleMatchesSeason(r.title, season))
+                  return filtered.length > 0 ? filtered : results
+                }
+                return results
+              })
+              .then(results => resultsToStreams(results, session.cookieString, 'mazepa', baseUrl, episode))
               .then(s => streams.push(...s))
           })
           .catch(err => console.error('Mazepa task error:', err.message))

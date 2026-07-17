@@ -10,28 +10,52 @@
 //
 // Memory constraints (≈512MB hosts): WebTorrent defaults download the
 // entire torrent, keep ~55 peers, and cache many pieces in RAM. We
-// deliberately deselect the full torrent, clamp Range windows, limit
-// peers/cache, keep one active torrent, and destroy aggressively.
+// write pieces to disk, deselect unused files, clamp Range windows,
+// limit peers/cache, keep few active torrents, and destroy aggressively.
 
 const WebTorrent = require('webtorrent')
 const { pipeline } = require('stream')
+const os = require('os')
+const path = require('path')
+const fs = require('fs')
+
+// КРИТИЧНО: без опції `path` WebTorrent зберігає всі завантажені шматки
+// файлу В ОПЕРАТИВНІЙ ПАМ'ЯТІ (MemoryChunkStore) і ніколи їх не звільняє
+// по мірі перегляду. Для великого відео (кілька GB) це неминуче з'їдає
+// всю доступну RAM за кілька хвилин перегляду — саме це й спричиняло
+// краш процесу на Render (512MB ліміту) з незрозумілою причиною
+// ("Cause of failure could not be determined" = SIGKILL від OOM,
+// його неможливо перехопити на рівні коду).
+// Рішення: писати шматки на диск (ephemeral storage є навіть на
+// безкоштовному Render) і чистити файли при видаленні торренту.
+const DOWNLOAD_PATH = path.join(os.tmpdir(), 'ua-stremio-torrents')
+try {
+  fs.mkdirSync(DOWNLOAD_PATH, { recursive: true })
+} catch (err) {
+  console.error('Не вдалось створити папку для torrent-даних:', err.message)
+}
 
 const MAX_CONNS = 8
 const STORE_CACHE_SLOTS = 3
 const MAX_WEB_CONNS = 4
 const DOWNLOAD_LIMIT = 3 * 1024 * 1024 // 3 MB/s — fewer in-flight pieces
-const IDLE_TIMEOUT = 3 * 60 * 1000 // 3 min (was 30) — reclaim RAM sooner
 const MAX_RANGE_BYTES = 4 * 1024 * 1024 // 4 MB per HTTP response
-const MAX_ACTIVE_TORRENTS = 1
+// Render free tier ≈512MB: one active torrent is safest; idle cleanup is short
+const MAX_CONCURRENT_TORRENTS = 1
+const IDLE_TIMEOUT = 3 * 60 * 1000
 
 // DHT/LSD/NAT-traversal вимкнені навмисно:
 //   - Toloka — приватний трекер, піри доступні ТІЛЬКИ через
 //     announce URL з персональним токеном, DHT там нічого не знайде
 //   - WebTorrent з увімкненим DHT відкриває десятки UDP-портів
-//     (пошук по всій мережі), через що Render.com попереджав
-//     "Detected more than the maximum number (75) of ports" і,
-//     судячи з періодичних рестартів контейнера в логах, це й
-//     було причиною нестабільної/повільної роботи
+//     через що Render.com попереджав про ліміт портів і, судячи
+//     з логів, перезапускав контейнер
+// downloadLimit обмежує швидкість завантаження на рівні КЛІЄНТА (всі
+// торренти разом). Без цього WebTorrent тягне дані з мережі настільки
+// швидко, наскільки дозволяють сіди — якщо роздача швидка, а диск/HTTP-
+// стрім до Stremio встигають повільніше, непрочитані шматки чекають
+// своєї черги і накопичуються в пам'яті (внутрішні буфери мережевих
+// сокетів і черга запису на диск).
 const client = new WebTorrent({
   dht: false,
   lsd: false,
@@ -47,105 +71,130 @@ client.on('error', err => {
   console.error('WebTorrent client error:', err.message)
 })
 
-const activeTorrents = new Map()
-
-function logMemory(label) {
-  const m = process.memoryUsage()
+// Періодичний лог пам'яті процесу — для діагностики чи справді витік
+// іде під час активного перегляду (допомагає підтвердити/спростувати
+// гіпотезу про накопичення буферів у RAM попри запис на диск)
+setInterval(() => {
+  const mem = process.memoryUsage()
   console.log(
-    `StreamServer [${label}]: rss=${(m.rss / 1e6).toFixed(0)}MB ` +
-    `heap=${(m.heapUsed / 1e6).toFixed(0)}MB torrents=${activeTorrents.size}`
+    `📊 RAM: rss=${Math.round(mem.rss / 1024 / 1024)}MB ` +
+    `heap=${Math.round(mem.heapUsed / 1024 / 1024)}MB ` +
+    `external=${Math.round(mem.external / 1024 / 1024)}MB ` +
+    `активних торрентів=${activeTorrents.size}`
   )
-}
+}, 30 * 1000)
 
-function destroyTorrent(infoHash) {
-  return new Promise(resolve => {
-    const entry = activeTorrents.get(infoHash)
-    if (entry?.cleanupTimer) clearTimeout(entry.cleanupTimer)
-    activeTorrents.delete(infoHash)
+const activeTorrents = new Map() // infoHash -> { torrent, cleanupTimer, lastUsed }
+const pendingAdds = new Map()    // infoHash -> Promise (захист від подвійного client.add при паралельних Range-запитах)
 
-    const torrent = client.get(infoHash)
-    if (!torrent) return resolve()
-
-    torrent.destroy({ destroyStore: true }, () => {
-      console.log(`StreamServer: знищено торрент ${infoHash}`)
-      resolve()
+function destroyTorrent(infoHash, reason) {
+  const entry = activeTorrents.get(infoHash)
+  if (!entry) return
+  console.log(`StreamServer: прибираємо торрент ${infoHash} (${reason})`)
+  if (entry.cleanupTimer) clearTimeout(entry.cleanupTimer)
+  const torrent = client.get(infoHash)
+  if (torrent) {
+    // destroyStore: true — видаляє завантажені файли з диску, інакше
+    // ephemeral storage на Render поступово заповниться сміттям від
+    // переглянутих раніше фільмів
+    torrent.destroy({ destroyStore: true }, err => {
+      if (err) console.error(`Помилка видалення файлів торренту ${infoHash}:`, err.message)
     })
-  })
-}
-
-async function evictOtherTorrents(keepInfoHash) {
-  const others = [...activeTorrents.keys()].filter(h => h !== keepInfoHash)
-  if (others.length === 0) return
-  // Keep only MAX_ACTIVE_TORRENTS (typically 1) to survive 512MB hosts
-  const overflow = Math.max(0, others.length - (MAX_ACTIVE_TORRENTS - 1))
-  await Promise.all(others.slice(0, overflow).map(destroyTorrent))
+  }
+  activeTorrents.delete(infoHash)
 }
 
 function scheduleCleanup(infoHash) {
   const entry = activeTorrents.get(infoHash)
   if (!entry) return
+  entry.lastUsed = Date.now()
   if (entry.cleanupTimer) clearTimeout(entry.cleanupTimer)
-  entry.cleanupTimer = setTimeout(() => {
-    console.log(`StreamServer: прибираємо неактивний торрент ${infoHash}`)
-    destroyTorrent(infoHash).then(() => logMemory('cleanup'))
-  }, IDLE_TIMEOUT)
+  entry.cleanupTimer = setTimeout(
+    () => destroyTorrent(infoHash, `неактивний ${IDLE_TIMEOUT / 60000} хв`),
+    IDLE_TIMEOUT
+  )
 }
 
-// WebTorrent selects the entire torrent with low priority on ready.
-// That alone OOMs on 512MB for multi-GB releases — remove it immediately.
-function deselectEntireTorrent(torrent) {
-  if (!torrent.pieces || torrent.pieces.length === 0) return
-  try {
-    torrent.deselect(0, torrent.pieces.length - 1, false)
-  } catch (err) {
-    console.error('StreamServer deselect error:', err.message)
+// Якщо перевищено ліміт одночасних торрентів — прибираємо найдавніше
+// використаний, щоб звільнити пам'ять під новий
+function evictOldestIfNeeded() {
+  if (activeTorrents.size < MAX_CONCURRENT_TORRENTS) return
+  let oldestHash = null
+  let oldestTime = Infinity
+  for (const [hash, entry] of activeTorrents) {
+    if (entry.lastUsed < oldestTime) {
+      oldestTime = entry.lastUsed
+      oldestHash = hash
+    }
   }
+  if (oldestHash) destroyTorrent(oldestHash, 'ліміт одночасних торрентів')
 }
 
-async function addTorrent(torrentBuffer, infoHash) {
+function addTorrent(torrentBuffer, infoHash) {
   if (activeTorrents.has(infoHash)) {
     scheduleCleanup(infoHash)
-    return activeTorrents.get(infoHash).torrent
+    return Promise.resolve(activeTorrents.get(infoHash).torrent)
   }
 
-  const existing = client.get(infoHash)
-  if (existing) {
-    activeTorrents.set(infoHash, { torrent: existing })
-    scheduleCleanup(infoHash)
-    return existing
+  // Захист від race condition: два паралельних Range-запити на той самий
+  // фільм (браузер/Stremio так роблять під час буферизації) можуть обидва
+  // потрапити сюди до того як перший встигне записати в activeTorrents
+  if (pendingAdds.has(infoHash)) {
+    return pendingAdds.get(infoHash)
   }
 
-  await evictOtherTorrents(infoHash)
+  const promise = new Promise((resolve, reject) => {
+    const existing = client.get(infoHash)
+    if (existing) {
+      activeTorrents.set(infoHash, { torrent: existing, lastUsed: Date.now() })
+      scheduleCleanup(infoHash)
+      pendingAdds.delete(infoHash)
+      return resolve(existing)
+    }
 
-  return new Promise((resolve, reject) => {
+    evictOldestIfNeeded()
+
     let torrent
     try {
+      // private: true — КЛЮЧОВЕ виправлення. Файли .torrent з Toloka не
+      // мають прапору "private" у метаданих (перевірено окремо), тому
+      // WebTorrent вважає торрент публічним і сам додає купу публічних
+      // UDP-трекерів (global.WEBTORRENT_ANNOUNCE) у спробах знайти пірів,
+      // яких там фізично немає — саме це відкривало 75+ портів і викликало
+      // попередження/рестарти від Render. Toloka — приватний трекер:
+      // піри існують ТІЛЬКИ через наш announce URL з токеном.
       torrent = client.add(torrentBuffer, {
+        path: DOWNLOAD_PATH,
         maxWebConns: MAX_WEB_CONNS,
+        private: true,
         uploads: false,
         storeCacheSlots: STORE_CACHE_SLOTS,
         destroyStoreOnDestroy: true,
       }, t => {
-        deselectEntireTorrent(t)
-        console.log(`StreamServer: торрент додано, файлів: ${t.files.length}`)
-        activeTorrents.set(infoHash, { torrent: t })
+        // Stop default whole-torrent selection until restrictToSingleFile runs
+        if (t.pieces.length > 0) {
+          try { t.deselect(0, t.pieces.length - 1, false) } catch (_) {}
+        }
+        console.log(`StreamServer: торрент додано, файлів: ${t.files.length} (активних торрентів: ${activeTorrents.size + 1})`)
+        activeTorrents.set(infoHash, { torrent: t, lastUsed: Date.now() })
         scheduleCleanup(infoHash)
-        logMemory('add')
+        pendingAdds.delete(infoHash)
         resolve(t)
       })
     } catch (err) {
+      pendingAdds.delete(infoHash)
       return reject(err)
     }
 
-    // Also deselect on ready in case selection is re-applied during verify
-    torrent.on('ready', () => deselectEntireTorrent(torrent))
-
     torrent.on('error', err => {
       console.error('StreamServer torrent error:', err.message)
-      activeTorrents.delete(infoHash)
+      pendingAdds.delete(infoHash)
       reject(err)
     })
   })
+
+  pendingAdds.set(infoHash, promise)
+  return promise
 }
 
 function pickVideoFile(torrent, fileIdx) {
@@ -160,6 +209,24 @@ function pickVideoFile(torrent, fileIdx) {
     }
   }
   return best || torrent.files[0]
+}
+
+// КРИТИЧНО: за замовчуванням WebTorrent вважає ВСІ файли торренту
+// "selected" і намагається завантажити їх усі одночасно. Для season-паку
+// з Toloka (напр. 36 файлів — цілий сезон) це означає паралельне
+// стягування ВСІХ епізодів одночасно замість одного потрібного.
+// Виправлення: явно прибираємо пріоритет з усіх файлів і залишаємо
+// тільки потрібний.
+function restrictToSingleFile(torrent, fileIdx) {
+  if (torrent.files.length <= 1) return
+  if (torrent._uaRestrictedTo === fileIdx) return
+  if (!torrent.files[fileIdx]) return
+
+  torrent.deselect(0, torrent.pieces.length - 1, false)
+  torrent.files[fileIdx].select()
+
+  torrent._uaRestrictedTo = fileIdx
+  console.log(`StreamServer: обмежено завантаження до файлу [${fileIdx}] "${torrent.files[fileIdx].name}" (з ${torrent.files.length})`)
 }
 
 function clampRange(start, end, fileSize) {
@@ -179,8 +246,6 @@ function clampRange(start, end, fileSize) {
 async function handleStreamRequest(req, res, torrentBuffer, infoHash, fileIdx) {
   let fileStream = null
 
-  // Якщо клієнт (Stremio) закриває з'єднання достроково — просто
-  // прибираємо read-стрім, це нормальна поведінка, не помилка сервера
   const onClientClose = () => {
     if (fileStream && !fileStream.destroyed) {
       fileStream.destroy()
@@ -198,6 +263,11 @@ async function handleStreamRequest(req, res, torrentBuffer, infoHash, fileIdx) {
       res.end('Video file not found in torrent')
       return
     }
+
+    // Знаходимо реальний індекс обраного файлу (fileIdx міг бути undefined,
+    // якщо pickVideoFile сама обирала найбільший файл)
+    const actualFileIdx = torrent.files.indexOf(file)
+    restrictToSingleFile(torrent, actualFileIdx)
 
     const range = req.headers.range
     const fileSize = file.length
@@ -232,13 +302,10 @@ async function handleStreamRequest(req, res, torrentBuffer, infoHash, fileIdx) {
 
     fileStream = file.createReadStream({ start, end })
 
-    // pipeline сам коректно обробляє помилки з обох боків (readStream і res)
-    // і не кидає необроблений 'error', на відміну від .pipe()
     pipeline(fileStream, res, (err) => {
       if (err && err.code !== 'ERR_STREAM_PREMATURE_CLOSE' && err.code !== 'PREMATURE_CLOSE') {
         console.error('Stream pipeline error:', err.message)
       }
-      // Прибираємо обробник щоб не накопичувались листенери
       req.removeListener('close', onClientClose)
     })
 
