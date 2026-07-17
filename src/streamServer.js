@@ -7,9 +7,22 @@
 // коректно працювати з приватними трекерами навіть коли infoHash +
 // sources передані правильно (відома проблема, підтверджена в
 // офіційному репозиторії Stremio: issues #676, #687).
+//
+// Memory constraints (≈512MB hosts): WebTorrent defaults download the
+// entire torrent, keep ~55 peers, and cache many pieces in RAM. We
+// deliberately deselect the full torrent, clamp Range windows, limit
+// peers/cache, keep one active torrent, and destroy aggressively.
 
 const WebTorrent = require('webtorrent')
 const { pipeline } = require('stream')
+
+const MAX_CONNS = 8
+const STORE_CACHE_SLOTS = 3
+const MAX_WEB_CONNS = 4
+const DOWNLOAD_LIMIT = 3 * 1024 * 1024 // 3 MB/s — fewer in-flight pieces
+const IDLE_TIMEOUT = 3 * 60 * 1000 // 3 min (was 30) — reclaim RAM sooner
+const MAX_RANGE_BYTES = 4 * 1024 * 1024 // 4 MB per HTTP response
+const MAX_ACTIVE_TORRENTS = 1
 
 // DHT/LSD/NAT-traversal вимкнені навмисно:
 //   - Toloka — приватний трекер, піри доступні ТІЛЬКИ через
@@ -25,6 +38,9 @@ const client = new WebTorrent({
   natUpnp: false,
   natPmp: false,
   webSeeds: false,
+  maxConns: MAX_CONNS,
+  downloadLimit: DOWNLOAD_LIMIT,
+  uploadLimit: 0, // proxy only — do not seed
 })
 
 client.on('error', err => {
@@ -32,7 +48,38 @@ client.on('error', err => {
 })
 
 const activeTorrents = new Map()
-const IDLE_TIMEOUT = 30 * 60 * 1000
+
+function logMemory(label) {
+  const m = process.memoryUsage()
+  console.log(
+    `StreamServer [${label}]: rss=${(m.rss / 1e6).toFixed(0)}MB ` +
+    `heap=${(m.heapUsed / 1e6).toFixed(0)}MB torrents=${activeTorrents.size}`
+  )
+}
+
+function destroyTorrent(infoHash) {
+  return new Promise(resolve => {
+    const entry = activeTorrents.get(infoHash)
+    if (entry?.cleanupTimer) clearTimeout(entry.cleanupTimer)
+    activeTorrents.delete(infoHash)
+
+    const torrent = client.get(infoHash)
+    if (!torrent) return resolve()
+
+    torrent.destroy({ destroyStore: true }, () => {
+      console.log(`StreamServer: знищено торрент ${infoHash}`)
+      resolve()
+    })
+  })
+}
+
+async function evictOtherTorrents(keepInfoHash) {
+  const others = [...activeTorrents.keys()].filter(h => h !== keepInfoHash)
+  if (others.length === 0) return
+  // Keep only MAX_ACTIVE_TORRENTS (typically 1) to survive 512MB hosts
+  const overflow = Math.max(0, others.length - (MAX_ACTIVE_TORRENTS - 1))
+  await Promise.all(others.slice(0, overflow).map(destroyTorrent))
+}
 
 function scheduleCleanup(infoHash) {
   const entry = activeTorrents.get(infoHash)
@@ -40,43 +87,62 @@ function scheduleCleanup(infoHash) {
   if (entry.cleanupTimer) clearTimeout(entry.cleanupTimer)
   entry.cleanupTimer = setTimeout(() => {
     console.log(`StreamServer: прибираємо неактивний торрент ${infoHash}`)
-    const torrent = client.get(infoHash)
-    if (torrent) torrent.destroy()
-    activeTorrents.delete(infoHash)
+    destroyTorrent(infoHash).then(() => logMemory('cleanup'))
   }, IDLE_TIMEOUT)
 }
 
-function addTorrent(torrentBuffer, infoHash) {
+// WebTorrent selects the entire torrent with low priority on ready.
+// That alone OOMs on 512MB for multi-GB releases — remove it immediately.
+function deselectEntireTorrent(torrent) {
+  if (!torrent.pieces || torrent.pieces.length === 0) return
+  try {
+    torrent.deselect(0, torrent.pieces.length - 1, false)
+  } catch (err) {
+    console.error('StreamServer deselect error:', err.message)
+  }
+}
+
+async function addTorrent(torrentBuffer, infoHash) {
+  if (activeTorrents.has(infoHash)) {
+    scheduleCleanup(infoHash)
+    return activeTorrents.get(infoHash).torrent
+  }
+
+  const existing = client.get(infoHash)
+  if (existing) {
+    activeTorrents.set(infoHash, { torrent: existing })
+    scheduleCleanup(infoHash)
+    return existing
+  }
+
+  await evictOtherTorrents(infoHash)
+
   return new Promise((resolve, reject) => {
-    if (activeTorrents.has(infoHash)) {
-      scheduleCleanup(infoHash)
-      return resolve(activeTorrents.get(infoHash).torrent)
-    }
-
-    const existing = client.get(infoHash)
-    if (existing) {
-      activeTorrents.set(infoHash, { torrent: existing })
-      scheduleCleanup(infoHash)
-      return resolve(existing)
-    }
-
     let torrent
     try {
-      // maxWebConns обмежує кількість одночасних TCP/UDP з'єднань —
-      // для приватного трекера з невеликою кількістю сідів цього
-      // достатньо і це додатково зменшує навантаження на порти
-      torrent = client.add(torrentBuffer, { maxWebConns: 20 }, t => {
+      torrent = client.add(torrentBuffer, {
+        maxWebConns: MAX_WEB_CONNS,
+        uploads: false,
+        storeCacheSlots: STORE_CACHE_SLOTS,
+        destroyStoreOnDestroy: true,
+      }, t => {
+        deselectEntireTorrent(t)
         console.log(`StreamServer: торрент додано, файлів: ${t.files.length}`)
         activeTorrents.set(infoHash, { torrent: t })
         scheduleCleanup(infoHash)
+        logMemory('add')
         resolve(t)
       })
     } catch (err) {
       return reject(err)
     }
 
+    // Also deselect on ready in case selection is re-applied during verify
+    torrent.on('ready', () => deselectEntireTorrent(torrent))
+
     torrent.on('error', err => {
       console.error('StreamServer torrent error:', err.message)
+      activeTorrents.delete(infoHash)
       reject(err)
     })
   })
@@ -94,6 +160,16 @@ function pickVideoFile(torrent, fileIdx) {
     }
   }
   return best || torrent.files[0]
+}
+
+function clampRange(start, end, fileSize) {
+  const safeStart = Math.max(0, Math.min(start, fileSize - 1))
+  let safeEnd = Math.min(end, fileSize - 1)
+  // Cap window so createReadStream only high-priority-selects a few pieces
+  if (safeEnd - safeStart + 1 > MAX_RANGE_BYTES) {
+    safeEnd = safeStart + MAX_RANGE_BYTES - 1
+  }
+  return { start: safeStart, end: safeEnd }
 }
 
 // Обробляє HTTP-запит на стрімінг з підтримкою Range.
@@ -137,12 +213,19 @@ async function handleStreamRequest(req, res, torrentBuffer, infoHash, fileIdx) {
     if (range) {
       const parts = range.replace(/bytes=/, '').split('-')
       start = parseInt(parts[0], 10) || 0
-      end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1
+      // Open-ended Range (bytes=N-) would otherwise select nearly the whole file
+      end = parts[1] ? parseInt(parts[1], 10) : start + MAX_RANGE_BYTES - 1
+      ;({ start, end } = clampRange(start, end, fileSize))
       status = 206
       headers['Content-Range'] = `bytes ${start}-${end}/${fileSize}`
       headers['Content-Length'] = end - start + 1
     } else {
-      headers['Content-Length'] = fileSize
+      // No Range: still serve a bounded first chunk as 206 so we never
+      // high-priority-select the entire multi-GB file into RAM.
+      ;({ start, end } = clampRange(0, MAX_RANGE_BYTES - 1, fileSize))
+      status = 206
+      headers['Content-Range'] = `bytes ${start}-${end}/${fileSize}`
+      headers['Content-Length'] = end - start + 1
     }
 
     res.writeHead(status, headers)
