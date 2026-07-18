@@ -142,7 +142,10 @@ async function resultsToStreams(results, cookieString, source, baseUrl, episode)
         continue
       }
 
-      torrentCache.set(parsed.infoHash, info.buffer)
+      if (!torrentCache.set(parsed.infoHash, info.buffer)) {
+        console.warn('Пропускаємо завеликий .torrent файл')
+        continue
+      }
 
       const fileIdx = pickVideoFileIdx(parsed.files, episode)
       const quality = result.title.match(/4K|2160p|1080p|720p|480p/i)?.[0] || 'HD'
