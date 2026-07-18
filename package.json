@@ -3,7 +3,8 @@
   "version": "2.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node --max-old-space-size=192 index.js",
+    "test": "node --test"
   },
   "keywords": [],
   "author": "",
@@ -15,5 +16,8 @@
     "parse-torrent": "^11.0.21",
     "stremio-addon-sdk": "^1.6.10",
     "webtorrent": "^1.9.7"
+  },
+  "devDependencies": {
+    "create-torrent": "^5.0.9"
   }
 }

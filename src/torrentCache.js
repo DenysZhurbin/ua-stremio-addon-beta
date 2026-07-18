@@ -9,14 +9,50 @@
 
 const cache = new Map()
 const TTL = 15 * 60 * 1000 // 15 хвилин вистачає щоб встигнути натиснути play
+const MAX_ENTRIES = 20
+const MAX_BYTES = 10 * 1024 * 1024
+let totalBytes = 0
+
+function remove(infoHash) {
+  const entry = cache.get(infoHash)
+  if (!entry) return
+  if (entry.timer) clearTimeout(entry.timer)
+  totalBytes -= entry.buffer.length
+  cache.delete(infoHash)
+}
+
+function evictOldest() {
+  const oldest = cache.keys().next().value
+  if (oldest !== undefined) remove(oldest)
+}
 
 function set(infoHash, buffer) {
-  cache.set(infoHash, buffer)
-  setTimeout(() => cache.delete(infoHash), TTL)
+  remove(infoHash)
+  if (buffer.length > MAX_BYTES) return false
+
+  while (
+    cache.size > 0 &&
+    (cache.size >= MAX_ENTRIES || totalBytes + buffer.length > MAX_BYTES)
+  ) {
+    evictOldest()
+  }
+
+  const timer = setTimeout(() => remove(infoHash), TTL)
+  timer.unref?.()
+  cache.set(infoHash, { buffer, timer })
+  totalBytes += buffer.length
+  return true
 }
 
 function get(infoHash) {
-  return cache.get(infoHash)
+  const entry = cache.get(infoHash)
+  if (!entry) return undefined
+
+  // Refresh insertion order so the byte/entry cap evicts least-recently-used
+  // metadata, while the original TTL still bounds credential-bearing buffers.
+  cache.delete(infoHash)
+  cache.set(infoHash, entry)
+  return entry.buffer
 }
 
 module.exports = { set, get }
