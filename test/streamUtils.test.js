@@ -9,33 +9,35 @@ const WebTorrent = require('webtorrent')
 
 const {
   createWebTorrentClientOptions,
-  deselectDefaultDownload,
-  limitTorrentTrackers,
+  formatAnnounceList,
   parseByteRange,
   parseCgroupInactiveFile,
+  redactAnnounceUrl,
   releasePeerThrottleStreams,
-  selectTrackerUrls,
+  restrictToSingleFile,
 } = require('../src/streamUtils')
 
 test('builds a bounded client without disabling peer protocol traffic', () => {
   assert.deepEqual(createWebTorrentClientOptions({
     maxConnections: 6,
-    downloadLimit: 3 * 1024 * 1024,
+    downloadLimit: 5 * 1024 * 1024,
     uploadLimit: 512 * 1024,
   }), {
     dht: false,
     lsd: false,
+    natUpnp: false,
+    natPmp: false,
     utp: true,
     webSeeds: false,
     maxConns: 6,
-    downloadLimit: 3 * 1024 * 1024,
+    downloadLimit: 5 * 1024 * 1024,
     uploadLimit: 512 * 1024,
   })
 
   assert.throws(
     () => createWebTorrentClientOptions({
       maxConnections: 6,
-      downloadLimit: 3 * 1024 * 1024,
+      downloadLimit: 5 * 1024 * 1024,
       uploadLimit: 0,
     }),
     /above zero/
@@ -119,42 +121,52 @@ test('rejects malformed, multiple, and out-of-bounds byte ranges', () => {
   assert.equal(parseByteRange('items=0-10', 2000), null)
 })
 
-test('prefers the source tracker and retains a bounded fallback set', () => {
-  const trackers = [
-    'udp://tracker-one.example:80/announce',
-    'https://bt.toloka.to/announce?token=secret',
-    'udp://tracker-two.example:1337/announce',
-    'udp://tracker-three.example:1337/announce',
-  ]
-
-  assert.deepEqual(selectTrackerUrls(trackers, 3), [
-    'https://bt.toloka.to/announce?token=secret',
-    'udp://tracker-one.example:80/announce',
-    'udp://tracker-two.example:1337/announce',
-  ])
+test('redacts tracker credentials in announce URLs', () => {
+  assert.equal(
+    redactAnnounceUrl('https://bt.toloka.to/announce?passkey=secret&name=x'),
+    'https://bt.toloka.to/announce?passkey=redacted&name=x'
+  )
+  assert.deepEqual(
+    formatAnnounceList([
+      'https://bt.toloka.to/announce?token=abc',
+      'udp://tracker.example:80/announce',
+    ]),
+    [
+      'https://bt.toloka.to/announce?token=redacted',
+      'udp://tracker.example:80/announce',
+    ]
+  )
 })
 
-test('falls back to a bounded HTTP tracker list', () => {
+test('restricts multi-file torrents to one selected file like main', () => {
+  const selected = []
   const torrent = {
-    announce: [
-      'udp://tracker-one.example:80/announce',
-      'https://tracker-two.example/announce',
-      'http://tracker-three.example/announce',
-      'https://tracker-four.example/announce',
+    _uaRestrictedTo: undefined,
+    pieces: [0, 1, 2, 3],
+    files: [
+      {
+        name: 'a.mkv',
+        select() {
+          selected.push(0)
+        },
+      },
+      {
+        name: 'b.mkv',
+        select() {
+          selected.push(1)
+        },
+      },
     ],
+    deselect() {},
   }
 
-  assert.deepEqual(limitTorrentTrackers(torrent, 2), {
-    before: 4,
-    after: 2,
-  })
-  assert.deepEqual(torrent.announce, [
-    'https://tracker-two.example/announce',
-    'http://tracker-three.example/announce',
-  ])
+  assert.equal(restrictToSingleFile(torrent, 1), true)
+  assert.equal(torrent._uaRestrictedTo, 1)
+  assert.deepEqual(selected, [1])
+  assert.equal(restrictToSingleFile(torrent, 1), false)
 })
 
-test('WebTorrent metadata hook removes its default whole-torrent selection', async t => {
+test('private torrents keep the full announce list from the .torrent file', async t => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ua-stream-test-'))
   const client = new WebTorrent({
     dht: false,
@@ -190,13 +202,12 @@ test('WebTorrent metadata hook removes its default whole-torrent selection', asy
     storeCacheSlots: 0,
     destroyStoreOnDestroy: true,
   })
-  torrent.once('infoHash', () => limitTorrentTrackers(torrent, 1))
-  torrent.once('metadata', () => deselectDefaultDownload(torrent))
 
   await once(torrent, 'ready')
 
   assert.deepEqual(torrent.announce, [
+    'udp://public-one.example:80/announce',
     'https://bt.toloka.to/announce?token=test',
+    'udp://public-two.example:80/announce',
   ])
-  assert.equal(torrent._selections.length, 0)
 })

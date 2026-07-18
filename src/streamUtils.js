@@ -1,5 +1,3 @@
-const PRIVATE_TRACKER_HOSTS = ['toloka.to', 'mazepa.to']
-
 function createWebTorrentClientOptions({
   maxConnections,
   downloadLimit,
@@ -18,6 +16,8 @@ function createWebTorrentClientOptions({
   return {
     dht: false,
     lsd: false,
+    natUpnp: false,
+    natPmp: false,
     // Toloka swarms contain many peers reachable only through uTP. A
     // postinstall compatibility patch reuses one UDP socket for all peers.
     utp: true,
@@ -28,58 +28,48 @@ function createWebTorrentClientOptions({
   }
 }
 
-function isPrivateTracker(url) {
+// Redact passkeys/tokens so Render logs stay useful without leaking credentials.
+function redactAnnounceUrl(url) {
   try {
-    const hostname = new URL(url).hostname.toLowerCase()
-    return PRIVATE_TRACKER_HOSTS.some(
-      host => hostname === host || hostname.endsWith(`.${host}`)
+    const parsed = new URL(String(url))
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (/(pass|key|token|auth|uid)/i.test(key)) {
+        parsed.searchParams.set(key, 'redacted')
+      }
+    }
+    return parsed.toString()
+  } catch (_) {
+    return String(url).replace(
+      /([?&](?:passkey|token|auth|uk|uid)=)[^&]+/gi,
+      '$1redacted'
     )
-  } catch (_) {
-    return false
   }
 }
 
-function isHttpTracker(url) {
-  try {
-    const protocol = new URL(url).protocol
-    return protocol === 'http:' || protocol === 'https:'
-  } catch (_) {
-    return false
-  }
+function formatAnnounceList(announce) {
+  return (Array.isArray(announce) ? announce : [])
+    .map(String)
+    .filter(Boolean)
+    .map(redactAnnounceUrl)
 }
 
-// Prefer the source tracker's announces, but retain a small fallback set.
-// Some Toloka torrents report zero peers on the first announce URL while the
-// other bundled trackers return the swarm. The hard cap prevents the old
-// unbounded tracker/port behavior.
-function selectTrackerUrls(announce, maxTrackers = 2) {
-  const unique = Array.from(
-    new Set((Array.isArray(announce) ? announce : []).map(String).filter(Boolean))
-  )
-
-  const sourceHttp = unique.filter(url => isPrivateTracker(url) && isHttpTracker(url))
-  const sourceOther = unique.filter(url => isPrivateTracker(url) && !isHttpTracker(url))
-  const fallbackHttp = unique.filter(url => !isPrivateTracker(url) && isHttpTracker(url))
-  const fallbackOther = unique.filter(url => !isPrivateTracker(url) && !isHttpTracker(url))
-  const preferred = [
-    ...sourceHttp,
-    ...sourceOther,
-    ...fallbackHttp,
-    ...fallbackOther,
-  ]
-
-  return preferred.slice(0, Math.max(1, maxTrackers))
-}
-
-function limitTorrentTrackers(torrent, maxTrackers = 2) {
-  const before = Array.isArray(torrent.announce) ? torrent.announce.length : 0
-  torrent.announce = selectTrackerUrls(torrent.announce, maxTrackers)
-  return { before, after: torrent.announce.length }
-}
-
+// Match main: keep every announce URL from the .torrent file. private:true is
+// what blocks WebTorrent's global public tracker list; trimming Toloka's own
+// announce set caused discovered=0 on Render.
 function deselectDefaultDownload(torrent) {
   if (!torrent.pieces || torrent.pieces.length === 0) return false
   torrent.deselect(0, torrent.pieces.length - 1, false)
+  return true
+}
+
+function restrictToSingleFile(torrent, fileIdx) {
+  if (!torrent?.files?.length || !torrent.pieces?.length) return false
+  if (!Number.isInteger(fileIdx) || !torrent.files[fileIdx]) return false
+  if (torrent._uaRestrictedTo === fileIdx) return false
+
+  torrent.deselect(0, torrent.pieces.length - 1, false)
+  torrent.files[fileIdx].select()
+  torrent._uaRestrictedTo = fileIdx
   return true
 }
 
@@ -158,9 +148,10 @@ function parseByteRange(header, size) {
 module.exports = {
   createWebTorrentClientOptions,
   deselectDefaultDownload,
-  limitTorrentTrackers,
+  formatAnnounceList,
   parseCgroupInactiveFile,
   parseByteRange,
+  redactAnnounceUrl,
   releasePeerThrottleStreams,
-  selectTrackerUrls,
+  restrictToSingleFile,
 }
