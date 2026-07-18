@@ -119,15 +119,18 @@ test('rejects malformed, multiple, and out-of-bounds byte ranges', () => {
   assert.equal(parseByteRange('items=0-10', 2000), null)
 })
 
-test('prefers the source private tracker and removes public UDP lists', () => {
+test('prefers the source tracker and retains a bounded fallback set', () => {
   const trackers = [
     'udp://tracker-one.example:80/announce',
     'https://bt.toloka.to/announce?token=secret',
     'udp://tracker-two.example:1337/announce',
+    'udp://tracker-three.example:1337/announce',
   ]
 
-  assert.deepEqual(selectTrackerUrls(trackers), [
+  assert.deepEqual(selectTrackerUrls(trackers, 3), [
     'https://bt.toloka.to/announce?token=secret',
+    'udp://tracker-one.example:80/announce',
+    'udp://tracker-two.example:1337/announce',
   ])
 })
 

@@ -48,18 +48,25 @@ function isHttpTracker(url) {
   }
 }
 
-// Private .torrent files sometimes contain large public tracker lists. Each
-// UDP tracker can open a separate socket, which exceeds Render's port limit.
-// Prefer the tracker belonging to the source site and keep a small fallback.
+// Prefer the source tracker's announces, but retain a small fallback set.
+// Some Toloka torrents report zero peers on the first announce URL while the
+// other bundled trackers return the swarm. The hard cap prevents the old
+// unbounded tracker/port behavior.
 function selectTrackerUrls(announce, maxTrackers = 2) {
   const unique = Array.from(
     new Set((Array.isArray(announce) ? announce : []).map(String).filter(Boolean))
   )
 
-  const privateTrackers = unique.filter(isPrivateTracker)
-  const candidates = privateTrackers.length > 0 ? privateTrackers : unique
-  const httpTrackers = candidates.filter(isHttpTracker)
-  const preferred = httpTrackers.length > 0 ? httpTrackers : candidates
+  const sourceHttp = unique.filter(url => isPrivateTracker(url) && isHttpTracker(url))
+  const sourceOther = unique.filter(url => isPrivateTracker(url) && !isHttpTracker(url))
+  const fallbackHttp = unique.filter(url => !isPrivateTracker(url) && isHttpTracker(url))
+  const fallbackOther = unique.filter(url => !isPrivateTracker(url) && !isHttpTracker(url))
+  const preferred = [
+    ...sourceHttp,
+    ...sourceOther,
+    ...fallbackHttp,
+    ...fallbackOther,
+  ]
 
   return preferred.slice(0, Math.max(1, maxTrackers))
 }
