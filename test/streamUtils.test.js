@@ -25,7 +25,7 @@ test('builds a bounded client without disabling peer protocol traffic', () => {
   }), {
     dht: false,
     lsd: false,
-    utp: false,
+    utp: true,
     webSeeds: false,
     maxConns: 6,
     downloadLimit: 3 * 1024 * 1024,

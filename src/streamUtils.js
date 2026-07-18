@@ -18,7 +18,9 @@ function createWebTorrentClientOptions({
   return {
     dht: false,
     lsd: false,
-    utp: false,
+    // Toloka swarms contain many peers reachable only through uTP. A
+    // postinstall compatibility patch reuses one UDP socket for all peers.
+    utp: true,
     webSeeds: false,
     maxConns: maxConnections,
     downloadLimit,

@@ -3,6 +3,7 @@
   "version": "2.0.0",
   "main": "index.js",
   "scripts": {
+    "postinstall": "node scripts/patch-webtorrent.js",
     "start": "node --max-old-space-size=192 index.js",
     "test": "node --test"
   },

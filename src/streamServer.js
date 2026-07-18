@@ -46,6 +46,9 @@ const client = new WebTorrent(createWebTorrentClientOptions({
   downloadLimit: DOWNLOAD_LIMIT,
   uploadLimit: UPLOAD_LIMIT,
 }))
+console.log(
+  `StreamServer: peer transports TCP${client.utp ? ' + uTP (shared UDP socket)' : ' only'}`
+)
 
 client.on('error', err => {
   console.error('WebTorrent client error:', err.message)
@@ -95,6 +98,14 @@ const memoryLogTimer = setInterval(() => {
     (total, torrent) => total + (torrent.wires?.length || 0),
     0
   )
+  const pendingPeers = client.torrents.reduce(
+    (total, torrent) => total + (torrent._numPending || 0),
+    0
+  )
+  const queuedPeers = client.torrents.reduce(
+    (total, torrent) => total + (torrent._queue?.length || 0),
+    0
+  )
   const streams = Array.from(activeTorrents.values()).reduce(
     (total, entry) => total + entry.streams.size,
     0
@@ -110,7 +121,8 @@ const memoryLogTimer = setInterval(() => {
     (containerWorkingSet
       ? `workingSet=${Math.round(containerWorkingSet / 1024 / 1024)}MB `
       : '') +
-    `торрентів=${activeTorrents.size} peers=${peers} streams=${streams}`
+    `торрентів=${activeTorrents.size} peers=${peers} ` +
+    `pending=${pendingPeers} queued=${queuedPeers} streams=${streams}`
   )
 }, 30 * 1000)
 memoryLogTimer.unref?.()
@@ -121,6 +133,7 @@ const IDLE_TIMEOUT = 3 * 60 * 1000
 // infoHash -> { torrent, cleanupTimer, lastUsed, streams: Set<Readable> }
 const activeTorrents = new Map()
 const pendingAdds = new Map()    // infoHash -> Promise (захист від подвійного client.add при паралельних Range-запитах)
+const pendingDestroys = new Map()
 let addQueue = Promise.resolve()
 let memoryGuardRunning = false
 
@@ -159,7 +172,7 @@ function destroyTorrent(infoHash, reason) {
   const torrent = entry?.torrent || client.get(infoHash)
   if (!entry && !torrent) {
     releaseUnusedPeerThrottles()
-    return Promise.resolve()
+    return pendingDestroys.get(infoHash) || Promise.resolve()
   }
 
   activeTorrents.delete(infoHash)
@@ -170,19 +183,36 @@ function destroyTorrent(infoHash, reason) {
 
   if (!torrent || torrent.destroyed) {
     releaseUnusedPeerThrottles()
-    return Promise.resolve()
+    return pendingDestroys.get(infoHash) || Promise.resolve()
   }
 
   console.log(`StreamServer: прибираємо торрент ${infoHash} (${reason})`)
-  return new Promise(resolve => {
+  let resolveCleanup
+  const cleanup = new Promise(resolve => {
+    resolveCleanup = resolve
+  })
+  pendingDestroys.set(infoHash, cleanup)
+
+  try {
     torrent.destroy({ destroyStore: true }, err => {
       if (err) {
         console.error(`Помилка видалення торренту ${infoHash}:`, err.message)
       }
       releaseUnusedPeerThrottles()
-      resolve()
+      resolveCleanup()
     })
+  } catch (err) {
+    console.error(`Помилка видалення торренту ${infoHash}:`, err.message)
+    resolveCleanup()
+  }
+
+  // torrent.destroy() synchronously closes peer sockets. Release their
+  // throttles now; tracker/store cleanup can take many seconds on Render.
+  releaseUnusedPeerThrottles()
+  cleanup.then(() => {
+    if (pendingDestroys.get(infoHash) === cleanup) pendingDestroys.delete(infoHash)
   })
+  return cleanup
 }
 
 function scheduleCleanup(infoHash) {
@@ -253,6 +283,7 @@ function createTorrent(torrentBuffer, infoHash) {
     try {
       torrent = client.add(torrentBuffer, {
         path: DOWNLOAD_PATH,
+        addUID: true,
         private: true,
         uploads: 1,
         storeCacheSlots: STORE_CACHE_SLOTS,
@@ -273,7 +304,8 @@ function createTorrent(torrentBuffer, infoHash) {
         scheduleCleanup(infoHash)
         console.log(
           `StreamServer: торрент додано, файлів: ${readyTorrent.files.length} ` +
-          `(trackers=${readyTorrent.announce.length}, cacheSlots=${STORE_CACHE_SLOTS})`
+          `(trackers=${readyTorrent.announce.length}, cacheSlots=${STORE_CACHE_SLOTS}, ` +
+          `utp=${client.utp})`
         )
         resolve(readyTorrent)
       })
@@ -292,6 +324,27 @@ function createTorrent(torrentBuffer, infoHash) {
       }
     })
     torrent.once('metadata', () => safelyDeselectDefaultDownload(torrent))
+
+    let discoveredPeers = 0
+    let loggedConnectedPeer = false
+    torrent.on('peer', () => {
+      discoveredPeers += 1
+    })
+    torrent.on('wire', () => {
+      if (loggedConnectedPeer) return
+      loggedConnectedPeer = true
+      console.log(
+        `StreamServer: peer підключено ` +
+        `(discovered=${discoveredPeers}, connected=${torrent.numPeers})`
+      )
+    })
+    torrent.on('noPeers', source => {
+      console.warn(
+        `StreamServer: поки немає підключених peers ` +
+        `(source=${source}, discovered=${discoveredPeers}, ` +
+        `pending=${torrent._numPending || 0}, queued=${torrent._queue?.length || 0})`
+      )
+    })
 
     torrent.on('error', err => {
       console.error('StreamServer torrent error:', err.message)
@@ -314,6 +367,12 @@ function createTorrent(torrentBuffer, infoHash) {
 }
 
 async function addTorrentExclusive(torrentBuffer, infoHash) {
+  // Never recreate the same store while its previous files are still being
+  // removed. Different hashes use addUID-isolated directories and can switch
+  // immediately after peer sockets are synchronously closed.
+  const pendingDestroy = pendingDestroys.get(infoHash)
+  if (pendingDestroy) await pendingDestroy
+
   const active = activeTorrents.get(infoHash)
   if (active) {
     scheduleCleanup(infoHash)
@@ -333,12 +392,14 @@ async function addTorrentExclusive(torrentBuffer, infoHash) {
     return existing
   }
 
-  // Destruction is awaited so old peer/store buffers cannot overlap a new
-  // torrent on a 512 MB instance.
+  // Do not wait for slow tracker/store callbacks here. Render showed a
+  // 17-second wait during quality switches, long enough for Stremio to time
+  // out before the new torrent was even added.
   const others = Array.from(activeTorrents.keys()).filter(hash => hash !== infoHash)
   const overflow = Math.max(0, others.length - (MAX_CONCURRENT_TORRENTS - 1))
   for (const hash of others.slice(0, overflow)) {
-    await destroyTorrent(hash, 'ліміт одночасних торрентів')
+    destroyTorrent(hash, 'ліміт одночасних торрентів')
+      .catch(err => console.error('StreamServer cleanup error:', err.message))
   }
 
   return createTorrent(torrentBuffer, infoHash)
