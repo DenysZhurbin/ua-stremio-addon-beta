@@ -7,6 +7,11 @@
 // коректно працювати з приватними трекерами навіть коли infoHash +
 // sources передані правильно (відома проблема, підтверджена в
 // офіційному репозиторії Stremio: issues #676, #687).
+//
+// Memory constraints (≈512MB hosts): WebTorrent defaults download the
+// entire torrent, keep ~55 peers, and cache many pieces in RAM. We
+// write pieces to disk, deselect unused files, clamp Range windows,
+// limit peers/cache, keep few active torrents, and destroy aggressively.
 
 const WebTorrent = require('webtorrent')
 const { pipeline } = require('stream')
@@ -30,6 +35,15 @@ try {
   console.error('Не вдалось створити папку для torrent-даних:', err.message)
 }
 
+const MAX_CONNS = 8
+const STORE_CACHE_SLOTS = 3
+const MAX_WEB_CONNS = 4
+const DOWNLOAD_LIMIT = 3 * 1024 * 1024 // 3 MB/s — fewer in-flight pieces
+const MAX_RANGE_BYTES = 4 * 1024 * 1024 // 4 MB per HTTP response
+// Render free tier ≈512MB: one active torrent is safest; idle cleanup is short
+const MAX_CONCURRENT_TORRENTS = 1
+const IDLE_TIMEOUT = 3 * 60 * 1000
+
 // DHT/LSD/NAT-traversal вимкнені навмисно:
 //   - Toloka — приватний трекер, піри доступні ТІЛЬКИ через
 //     announce URL з персональним токеном, DHT там нічого не знайде
@@ -41,15 +55,16 @@ try {
 // швидко, наскільки дозволяють сіди — якщо роздача швидка, а диск/HTTP-
 // стрім до Stremio встигають повільніше, непрочитані шматки чекають
 // своєї черги і накопичуються в пам'яті (внутрішні буфери мережевих
-// сокетів і черга запису на диск). 5MB/s достатньо для комфортного
-// перегляду 1080p з запасом і тримає навантаження на RAM передбачуваним.
+// сокетів і черга запису на диск).
 const client = new WebTorrent({
   dht: false,
   lsd: false,
   natUpnp: false,
   natPmp: false,
   webSeeds: false,
-  downloadLimit: 5 * 1024 * 1024, // 5 MB/s
+  maxConns: MAX_CONNS,
+  downloadLimit: DOWNLOAD_LIMIT,
+  uploadLimit: 0, // proxy only — do not seed
 })
 
 client.on('error', err => {
@@ -68,16 +83,6 @@ setInterval(() => {
     `активних торрентів=${activeTorrents.size}`
   )
 }, 30 * 1000)
-
-// Render free tier має тільки 512MB RAM. Кожен активний торрент тримає
-// піри, буфери шматків і відкриті з'єднання — кілька одночасних торрентів
-// (наприклад, юзер за 20 хв "потикав" 4-5 різних фільмів) можуть вичерпати
-// пам'ять і призвести до OOM-рестарту процесу (саме це й спостерігалось:
-// сервер "падав через якийсь час"). Тому:
-//   - тримаємо не більше MAX_CONCURRENT торрентів одночасно (LRU-витіснення)
-//   - і чистимо неактивні набагато швидше (10 хв замість 30)
-const MAX_CONCURRENT_TORRENTS = 2
-const IDLE_TIMEOUT = 10 * 60 * 1000
 
 const activeTorrents = new Map() // infoHash -> { torrent, cleanupTimer, lastUsed }
 const pendingAdds = new Map()    // infoHash -> Promise (захист від подвійного client.add при паралельних Range-запитах)
@@ -104,7 +109,10 @@ function scheduleCleanup(infoHash) {
   if (!entry) return
   entry.lastUsed = Date.now()
   if (entry.cleanupTimer) clearTimeout(entry.cleanupTimer)
-  entry.cleanupTimer = setTimeout(() => destroyTorrent(infoHash, 'неактивний 10 хв'), IDLE_TIMEOUT)
+  entry.cleanupTimer = setTimeout(
+    () => destroyTorrent(infoHash, `неактивний ${IDLE_TIMEOUT / 60000} хв`),
+    IDLE_TIMEOUT
+  )
 }
 
 // Якщо перевищено ліміт одночасних торрентів — прибираємо найдавніше
@@ -157,9 +165,16 @@ function addTorrent(torrentBuffer, infoHash) {
       // піри існують ТІЛЬКИ через наш announce URL з токеном.
       torrent = client.add(torrentBuffer, {
         path: DOWNLOAD_PATH,
-        maxWebConns: 20,
+        maxWebConns: MAX_WEB_CONNS,
         private: true,
+        uploads: false,
+        storeCacheSlots: STORE_CACHE_SLOTS,
+        destroyStoreOnDestroy: true,
       }, t => {
+        // Stop default whole-torrent selection until restrictToSingleFile runs
+        if (t.pieces.length > 0) {
+          try { t.deselect(0, t.pieces.length - 1, false) } catch (_) {}
+        }
         console.log(`StreamServer: торрент додано, файлів: ${t.files.length} (активних торрентів: ${activeTorrents.size + 1})`)
         activeTorrents.set(infoHash, { torrent: t, lastUsed: Date.now() })
         scheduleCleanup(infoHash)
@@ -199,22 +214,29 @@ function pickVideoFile(torrent, fileIdx) {
 // КРИТИЧНО: за замовчуванням WebTorrent вважає ВСІ файли торренту
 // "selected" і намагається завантажити їх усі одночасно. Для season-паку
 // з Toloka (напр. 36 файлів — цілий сезон) це означає паралельне
-// стягування ВСІХ епізодів одночасно замість одного потрібного —
-// саме це й спричиняло безперервне зростання RAM (кожен епізод — свій
-// потік мережевих буферів) і множення портів (пірів на кожен файл),
-// навіть попри private:true і downloadLimit. Виправлення: явно
-// прибираємо пріоритет з усіх файлів і залишаємо тільки потрібний.
+// стягування ВСІХ епізодів одночасно замість одного потрібного.
+// Виправлення: явно прибираємо пріоритет з усіх файлів і залишаємо
+// тільки потрібний.
 function restrictToSingleFile(torrent, fileIdx) {
-  if (torrent.files.length <= 1) return // нема сенсу для однофайлових релізів
-  if (torrent._uaRestrictedTo === fileIdx) return // вже налаштовано саме на цей файл
+  if (torrent.files.length <= 1) return
+  if (torrent._uaRestrictedTo === fileIdx) return
+  if (!torrent.files[fileIdx]) return
 
-  // deselect(0, останній шматок, false) — знімає пріоритет з усього торренту
   torrent.deselect(0, torrent.pieces.length - 1, false)
-  // і одразу вибираємо тільки потрібний файл назад
   torrent.files[fileIdx].select()
 
   torrent._uaRestrictedTo = fileIdx
   console.log(`StreamServer: обмежено завантаження до файлу [${fileIdx}] "${torrent.files[fileIdx].name}" (з ${torrent.files.length})`)
+}
+
+function clampRange(start, end, fileSize) {
+  const safeStart = Math.max(0, Math.min(start, fileSize - 1))
+  let safeEnd = Math.min(end, fileSize - 1)
+  // Cap window so createReadStream only high-priority-selects a few pieces
+  if (safeEnd - safeStart + 1 > MAX_RANGE_BYTES) {
+    safeEnd = safeStart + MAX_RANGE_BYTES - 1
+  }
+  return { start: safeStart, end: safeEnd }
 }
 
 // Обробляє HTTP-запит на стрімінг з підтримкою Range.
@@ -261,12 +283,19 @@ async function handleStreamRequest(req, res, torrentBuffer, infoHash, fileIdx) {
     if (range) {
       const parts = range.replace(/bytes=/, '').split('-')
       start = parseInt(parts[0], 10) || 0
-      end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1
+      // Open-ended Range (bytes=N-) would otherwise select nearly the whole file
+      end = parts[1] ? parseInt(parts[1], 10) : start + MAX_RANGE_BYTES - 1
+      ;({ start, end } = clampRange(start, end, fileSize))
       status = 206
       headers['Content-Range'] = `bytes ${start}-${end}/${fileSize}`
       headers['Content-Length'] = end - start + 1
     } else {
-      headers['Content-Length'] = fileSize
+      // No Range: still serve a bounded first chunk as 206 so we never
+      // high-priority-select the entire multi-GB file into RAM.
+      ;({ start, end } = clampRange(0, MAX_RANGE_BYTES - 1, fileSize))
+      status = 206
+      headers['Content-Range'] = `bytes ${start}-${end}/${fileSize}`
+      headers['Content-Length'] = end - start + 1
     }
 
     res.writeHead(status, headers)
