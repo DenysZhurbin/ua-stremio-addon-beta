@@ -15,11 +15,11 @@ const path = require('path')
 const fs = require('fs')
 const {
   createWebTorrentClientOptions,
-  deselectDefaultDownload,
-  limitTorrentTrackers,
+  formatAnnounceList,
   parseByteRange,
   parseCgroupInactiveFile,
   releasePeerThrottleStreams,
+  restrictToSingleFile,
 } = require('./streamUtils')
 
 // WebTorrent already uses FSChunkStore in Node. A dedicated path makes
@@ -33,8 +33,7 @@ try {
 
 const MAX_CONNECTIONS = 6
 const STORE_CACHE_SLOTS = 0
-const MAX_TRACKERS = 3
-const DOWNLOAD_LIMIT = 3 * 1024 * 1024
+const DOWNLOAD_LIMIT = 5 * 1024 * 1024
 const UPLOAD_LIMIT = 512 * 1024
 const MEMORY_HIGH_WATERMARK = 420 * 1024 * 1024
 
@@ -127,8 +126,10 @@ const memoryLogTimer = setInterval(() => {
 }, 30 * 1000)
 memoryLogTimer.unref?.()
 
-const MAX_CONCURRENT_TORRENTS = 1
-const IDLE_TIMEOUT = 3 * 60 * 1000
+// Match main's concurrency window so Stremio probing another quality does not
+// immediately destroy the torrent that is still buffering peers.
+const MAX_CONCURRENT_TORRENTS = 2
+const IDLE_TIMEOUT = 10 * 60 * 1000
 
 // infoHash -> { torrent, cleanupTimer, lastUsed, streams: Set<Readable> }
 const activeTorrents = new Map()
@@ -259,16 +260,6 @@ function registerStream(infoHash, stream) {
   }
 }
 
-function safelyDeselectDefaultDownload(torrent) {
-  try {
-    // WebTorrent selects the whole torrent at low priority by default.
-    // File.createReadStream adds and later removes only the requested range.
-    deselectDefaultDownload(torrent)
-  } catch (err) {
-    console.error('StreamServer deselect error:', err.message)
-  }
-}
-
 function createTorrent(torrentBuffer, infoHash) {
   return new Promise((resolve, reject) => {
     let settled = false
@@ -281,11 +272,12 @@ function createTorrent(torrentBuffer, infoHash) {
     }
 
     try {
+      // private: true blocks WebTorrent's global public announce list.
+      // Keep the .torrent announce URLs untouched — main's working path.
       torrent = client.add(torrentBuffer, {
         path: DOWNLOAD_PATH,
         addUID: true,
         private: true,
-        uploads: 1,
         storeCacheSlots: STORE_CACHE_SLOTS,
         destroyStoreOnDestroy: true,
       }, readyTorrent => {
@@ -305,7 +297,7 @@ function createTorrent(torrentBuffer, infoHash) {
         console.log(
           `StreamServer: торрент додано, файлів: ${readyTorrent.files.length} ` +
           `(trackers=${readyTorrent.announce.length}, cacheSlots=${STORE_CACHE_SLOTS}, ` +
-          `utp=${client.utp})`
+          `utp=${client.utp}, port=${client.torrentPort || 0})`
         )
         resolve(readyTorrent)
       })
@@ -313,17 +305,12 @@ function createTorrent(torrentBuffer, infoHash) {
       return rejectOnce(err)
     }
 
-    // Full .torrent metadata is parsed in a microtask, so these listeners run
-    // before tracker discovery and before any pieces can be requested.
     torrent.once('infoHash', () => {
-      const trackers = limitTorrentTrackers(torrent, MAX_TRACKERS)
-      if (trackers.before !== trackers.after) {
-        console.log(
-          `StreamServer: обмежено trackers ${trackers.before} -> ${trackers.after}`
-        )
-      }
+      const announces = formatAnnounceList(torrent.announce)
+      console.log(
+        `StreamServer: announce[${announces.length}]=${announces.join(' | ') || '(none)'}`
+      )
     })
-    torrent.once('metadata', () => safelyDeselectDefaultDownload(torrent))
 
     let discoveredPeers = 0
     let loggedConnectedPeer = false
@@ -338,11 +325,15 @@ function createTorrent(torrentBuffer, infoHash) {
         `(discovered=${discoveredPeers}, connected=${torrent.numPeers})`
       )
     })
+    torrent.on('warning', err => {
+      console.warn(`StreamServer tracker warning: ${err.message}`)
+    })
     torrent.on('noPeers', source => {
       console.warn(
         `StreamServer: поки немає підключених peers ` +
         `(source=${source}, discovered=${discoveredPeers}, ` +
-        `pending=${torrent._numPending || 0}, queued=${torrent._queue?.length || 0})`
+        `pending=${torrent._numPending || 0}, queued=${torrent._queue?.length || 0}, ` +
+        `trackers=${torrent.announce?.length || 0}, port=${client.torrentPort || 0})`
       )
     })
 
@@ -387,7 +378,6 @@ async function addTorrentExclusive(torrentBuffer, infoHash) {
       lastUsed: Date.now(),
       streams: new Set(),
     })
-    safelyDeselectDefaultDownload(existing)
     scheduleCleanup(infoHash)
     return existing
   }
@@ -459,6 +449,16 @@ async function handleStreamRequest(req, res, torrentBuffer, infoHash, fileIdx) {
       res.writeHead(404)
       res.end('Video file not found in torrent')
       return
+    }
+
+    // Same as main: only for multi-file season packs deselect siblings and keep
+    // the chosen file selected. createReadStream then prioritizes the Range.
+    const actualFileIdx = torrent.files.indexOf(file)
+    if (torrent.files.length > 1 && restrictToSingleFile(torrent, actualFileIdx)) {
+      console.log(
+        `StreamServer: обмежено завантаження до файлу [${actualFileIdx}] ` +
+        `"${file.name}" (з ${torrent.files.length})`
+      )
     }
 
     const fileSize = file.length
