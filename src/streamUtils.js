@@ -62,13 +62,15 @@ function deselectDefaultDownload(torrent) {
   return true
 }
 
+// Deselect every piece so WebTorrent does not background-download the whole
+// release into /tmp. createReadStream() selects only the active HTTP Range.
+// Do not call file.select() — that would re-select the entire multi-GB file.
 function restrictToSingleFile(torrent, fileIdx) {
   if (!torrent?.files?.length || !torrent.pieces?.length) return false
   if (!Number.isInteger(fileIdx) || !torrent.files[fileIdx]) return false
   if (torrent._uaRestrictedTo === fileIdx) return false
 
   torrent.deselect(0, torrent.pieces.length - 1, false)
-  torrent.files[fileIdx].select()
   torrent._uaRestrictedTo = fileIdx
   return true
 }

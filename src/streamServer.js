@@ -15,6 +15,7 @@ const path = require('path')
 const fs = require('fs')
 const {
   createWebTorrentClientOptions,
+  deselectDefaultDownload,
   formatAnnounceList,
   parseByteRange,
   parseCgroupInactiveFile,
@@ -25,11 +26,66 @@ const {
 // WebTorrent already uses FSChunkStore in Node. A dedicated path makes
 // ephemeral files predictable and lets destroyStore remove them reliably.
 const DOWNLOAD_PATH = path.join(os.tmpdir(), 'ua-stremio-torrents')
-try {
-  fs.mkdirSync(DOWNLOAD_PATH, { recursive: true })
-} catch (err) {
-  console.error('Не вдалось створити папку для torrent-даних:', err.message)
+
+// Hosts like Render/Beamup often cap ephemeral /tmp around 2GB. Stay under
+// that with a watermark and wipe leftovers from previous crashes on boot.
+const DISK_HIGH_WATERMARK = 1200 * 1024 * 1024
+
+function getDirectorySizeBytes(dirPath) {
+  let total = 0
+  let entries
+  try {
+    entries = fs.readdirSync(dirPath, { withFileTypes: true })
+  } catch (_) {
+    return 0
+  }
+  for (const entry of entries) {
+    const fullPath = path.join(dirPath, entry.name)
+    try {
+      if (entry.isDirectory()) {
+        total += getDirectorySizeBytes(fullPath)
+      } else if (entry.isFile()) {
+        total += fs.statSync(fullPath).size
+      }
+    } catch (_) {}
+  }
+  return total
 }
+
+function removeStoreDirsForHash(infoHash) {
+  if (!infoHash) return
+  const suffix = ` - ${String(infoHash).slice(0, 8).toLowerCase()}`
+  let entries
+  try {
+    entries = fs.readdirSync(DOWNLOAD_PATH)
+  } catch (_) {
+    return
+  }
+  for (const name of entries) {
+    if (!name.toLowerCase().endsWith(suffix)) continue
+    try {
+      fs.rmSync(path.join(DOWNLOAD_PATH, name), { recursive: true, force: true })
+      console.log(`StreamServer: примусово видалено store "${name}"`)
+    } catch (err) {
+      console.error(`StreamServer: не вдалось видалити store "${name}":`, err.message)
+    }
+  }
+}
+
+function resetDownloadPath() {
+  try {
+    fs.rmSync(DOWNLOAD_PATH, { recursive: true, force: true })
+  } catch (err) {
+    console.error('Не вдалось очистити папку torrent-даних:', err.message)
+  }
+  try {
+    fs.mkdirSync(DOWNLOAD_PATH, { recursive: true })
+  } catch (err) {
+    console.error('Не вдалось створити папку для torrent-даних:', err.message)
+  }
+}
+
+resetDownloadPath()
 
 const MAX_CONNECTIONS = 6
 const STORE_CACHE_SLOTS = 0
@@ -109,6 +165,7 @@ const memoryLogTimer = setInterval(() => {
     (total, entry) => total + entry.streams.size,
     0
   )
+  const diskUsed = getDirectorySizeBytes(DOWNLOAD_PATH)
   console.log(
     `📊 RAM: rss=${Math.round(mem.rss / 1024 / 1024)}MB ` +
     `heap=${Math.round(mem.heapUsed / 1024 / 1024)}MB ` +
@@ -120,6 +177,7 @@ const memoryLogTimer = setInterval(() => {
     (containerWorkingSet
       ? `workingSet=${Math.round(containerWorkingSet / 1024 / 1024)}MB `
       : '') +
+    `disk=${Math.round(diskUsed / 1024 / 1024)}MB ` +
     `торрентів=${activeTorrents.size} peers=${peers} ` +
     `pending=${pendingPeers} queued=${queuedPeers} streams=${streams}`
   )
@@ -129,7 +187,8 @@ memoryLogTimer.unref?.()
 // Match main's concurrency window so Stremio probing another quality does not
 // immediately destroy the torrent that is still buffering peers.
 const MAX_CONCURRENT_TORRENTS = 2
-const IDLE_TIMEOUT = 10 * 60 * 1000
+// Keep idle piece data briefly; long holds fill the 2GB /tmp quota.
+const IDLE_TIMEOUT = 2 * 60 * 1000
 
 // infoHash -> { torrent, cleanupTimer, lastUsed, streams: Set<Readable> }
 const activeTorrents = new Map()
@@ -137,6 +196,7 @@ const pendingAdds = new Map()    // infoHash -> Promise (захист від п�
 const pendingDestroys = new Map()
 let addQueue = Promise.resolve()
 let memoryGuardRunning = false
+let diskGuardRunning = false
 
 const memoryGuardTimer = setInterval(async () => {
   if (memoryGuardRunning || client.torrents.length === 0) return
@@ -160,6 +220,48 @@ const memoryGuardTimer = setInterval(async () => {
   }
 }, 5 * 1000)
 memoryGuardTimer.unref?.()
+
+const diskGuardTimer = setInterval(async () => {
+  if (diskGuardRunning) return
+  const diskUsed = getDirectorySizeBytes(DOWNLOAD_PATH)
+  if (diskUsed < DISK_HIGH_WATERMARK) return
+
+  if (activeTorrents.size === 0) {
+    console.error(
+      `StreamServer: disk ${Math.round(diskUsed / 1024 / 1024)}MB over watermark ` +
+      `без активних торрентів — очищаємо store`
+    )
+    resetDownloadPath()
+    return
+  }
+
+  const idleCandidate = Array.from(activeTorrents.entries())
+    .filter(([, entry]) => entry.streams.size === 0)
+    .sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0]
+
+  if (!idleCandidate) {
+    console.error(
+      `StreamServer: disk ${Math.round(diskUsed / 1024 / 1024)}MB over watermark, ` +
+      `але всі торренти активні — чекаємо idle cleanup`
+    )
+    return
+  }
+
+  const [infoHash] = idleCandidate
+  diskGuardRunning = true
+  console.error(
+    `StreamServer: disk high watermark ` +
+    `${Math.round(diskUsed / 1024 / 1024)}MB; зупиняємо торрент ${infoHash}`
+  )
+  try {
+    await destroyTorrent(infoHash, 'disk high watermark')
+  } catch (err) {
+    console.error('StreamServer disk guard error:', err.message)
+  } finally {
+    diskGuardRunning = false
+  }
+}, 5 * 1000)
+diskGuardTimer.unref?.()
 
 function releaseUnusedPeerThrottles() {
   const released = releasePeerThrottleStreams(client)
@@ -198,12 +300,14 @@ function destroyTorrent(infoHash, reason) {
     torrent.destroy({ destroyStore: true }, err => {
       if (err) {
         console.error(`Помилка видалення торренту ${infoHash}:`, err.message)
+        removeStoreDirsForHash(infoHash)
       }
       releaseUnusedPeerThrottles()
       resolveCleanup()
     })
   } catch (err) {
     console.error(`Помилка видалення торренту ${infoHash}:`, err.message)
+    removeStoreDirsForHash(infoHash)
     resolveCleanup()
   }
 
@@ -286,6 +390,10 @@ function createTorrent(torrentBuffer, infoHash) {
           return rejectOnce(new Error('Torrent info hash does not match watch URL'))
         }
 
+        // WebTorrent selects every piece on metadata; undo that so only the
+        // active HTTP Range is fetched into /tmp.
+        deselectDefaultDownload(readyTorrent)
+
         settled = true
         activeTorrents.set(infoHash, {
           torrent: readyTorrent,
@@ -304,6 +412,12 @@ function createTorrent(torrentBuffer, infoHash) {
     } catch (err) {
       return rejectOnce(err)
     }
+
+    // Deselect as soon as pieces exist — before ready — to avoid filling /tmp
+    // while season packs announce and connect peers.
+    torrent.on('metadata', () => {
+      deselectDefaultDownload(torrent)
+    })
 
     torrent.once('infoHash', () => {
       const announces = formatAnnounceList(torrent.announce)
@@ -451,10 +565,10 @@ async function handleStreamRequest(req, res, torrentBuffer, infoHash, fileIdx) {
       return
     }
 
-    // Same as main: only for multi-file season packs deselect siblings and keep
-    // the chosen file selected. createReadStream then prioritizes the Range.
+    // Deselect the whole torrent (and sibling season-pack files). createReadStream
+    // then selects only the requested Range — not the multi-GB file on disk.
     const actualFileIdx = torrent.files.indexOf(file)
-    if (torrent.files.length > 1 && restrictToSingleFile(torrent, actualFileIdx)) {
+    if (restrictToSingleFile(torrent, actualFileIdx)) {
       console.log(
         `StreamServer: обмежено завантаження до файлу [${actualFileIdx}] ` +
         `"${file.name}" (з ${torrent.files.length})`

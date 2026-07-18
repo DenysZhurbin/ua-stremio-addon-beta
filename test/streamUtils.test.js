@@ -9,6 +9,7 @@ const WebTorrent = require('webtorrent')
 
 const {
   createWebTorrentClientOptions,
+  deselectDefaultDownload,
   formatAnnounceList,
   parseByteRange,
   parseCgroupInactiveFile,
@@ -138,8 +139,9 @@ test('redacts tracker credentials in announce URLs', () => {
   )
 })
 
-test('restricts multi-file torrents to one selected file like main', () => {
+test('restricts torrents without selecting the whole file for disk download', () => {
   const selected = []
+  let deselected = false
   const torrent = {
     _uaRestrictedTo: undefined,
     pieces: [0, 1, 2, 3],
@@ -157,13 +159,33 @@ test('restricts multi-file torrents to one selected file like main', () => {
         },
       },
     ],
-    deselect() {},
+    deselect() {
+      deselected = true
+    },
   }
 
   assert.equal(restrictToSingleFile(torrent, 1), true)
   assert.equal(torrent._uaRestrictedTo, 1)
-  assert.deepEqual(selected, [1])
+  assert.equal(deselected, true)
+  assert.deepEqual(selected, [])
   assert.equal(restrictToSingleFile(torrent, 1), false)
+})
+
+test('deselects the default full-torrent download selection', () => {
+  let from
+  let to
+  const torrent = {
+    pieces: [0, 1, 2],
+    deselect(start, end) {
+      from = start
+      to = end
+    },
+  }
+
+  assert.equal(deselectDefaultDownload(torrent), true)
+  assert.equal(from, 0)
+  assert.equal(to, 2)
+  assert.equal(deselectDefaultDownload({ pieces: [] }), false)
 })
 
 test('private torrents keep the full announce list from the .torrent file', async t => {
